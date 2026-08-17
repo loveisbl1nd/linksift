@@ -71,6 +71,7 @@ LinkSift is a local-first media downloader powered by [yt-dlp](https://github.co
 
 - **Local-first by design** - Compose binds to `127.0.0.1:8899` by default.
 - **Batch-friendly queue** - paste one or more supported URLs and process them in sequence.
+- **Multi-output downloads** - select multiple output formats for a single URL (e.g., MP4 + MP3). When you choose both video and audio, LinkSift automatically extracts audio from the downloaded video using ffmpeg, saving bandwidth and time. Each completed output gets its own Save button, so you can save one result while the rest are still downloading.
 - **MP4 and MP3 output** - choose a preferred format before inspection.
 - **Quality selection** - choose from the available video heights returned by yt-dlp.
 - **Live progress** - phase, percentage, downloaded bytes, speed, ETA, and final status.
@@ -153,6 +154,182 @@ Maintainers should follow [RELEASING.md](RELEASING.md), including the one-time G
 Job state is held in memory. The Docker command therefore uses one Gunicorn worker; restarting the service or container clears queued and active job state, and partially downloaded `.part` files are not resumed automatically after a restart (the TTL cleanup removes them instead). This is accepted behavior for the local-first design. Do not add workers until job state moves to shared storage.
 
 Downloaded files and job status are a temporary cache, not an archive: LinkSift removes finished jobs and their files after `LINKSIFT_JOB_TTL` seconds and sweeps stale leftover files it created at startup and periodically while running. Active downloads are never touched by TTL cleanup. Save completed files through the browser before the TTL expires. Playlists larger than `LINKSIFT_MAX_PLAYLIST_ITEMS` only queue the first configured number of items; truncation is detected from the playlist size reported by yt-dlp, and unavailable or malformed playlist entries are skipped without failing the request.
+
+## Multi-output downloads (v0.3)
+
+Multi-output is available in LinkSift v0.3.0. One inspected URL can produce multiple explicit outputs (for example MP4 at a chosen height plus an MP3). The request becomes a single **parent job** with one **artifact** per output (`a000`, `a001`, …). Artifacts run sequentially under one shared deadline; each completed output is individually saveable while the others continue.
+
+### Overview
+
+- One request → one parent job → N artifacts.
+- Artifacts run sequentially, never in parallel. Videos run before audio so the pipeline can reuse a downloaded MP4 as the source for an MP3 instead of re-downloading.
+- The parent holds one queue entry, one worker slot, and one subprocess registry slot at a time. There is no per-artifact concurrency.
+- Each artifact has its own status, phase, progress, and Save button. A completed artifact can be saved before the parent finishes.
+- A `partial` parent status means some artifacts succeeded and others failed; the completed ones remain saveable.
+
+### Using the UI
+
+1. Paste a URL and let LinkSift inspect it (metadata is fetched without downloading media first).
+2. Choose the outputs you want: MP4 at one or more heights, MP3 audio, or any combination. When you select both video and audio, LinkSift extracts audio from the downloaded video with ffmpeg, saving bandwidth and time.
+3. Follow progress per artifact. Each card shows phase, speed, ETA, and percent. Save individual completed outputs through the browser or an optional folder picker while the rest are still running.
+
+### API: legacy single-output request
+
+The original `format` / `format_id` fields still work and produce a single-artifact parent for backward compatibility:
+
+```json
+POST /api/download
+{
+  "url": "https://example.com/watch?v=...",
+  "format": "audio"
+}
+```
+
+### API: multi-output request
+
+Send an `outputs` array. Each entry is an object with `type` (`video` or `audio`). A `video` entry also requires a `format_id` (the yt-dlp format id, e.g. `137` for 1080p MP4). Audio entries omit `format_id`.
+
+```json
+POST /api/download
+{
+  "url": "https://example.com/watch?v=...",
+  "outputs": [
+    {"type": "video", "format_id": "137"},
+    {"type": "audio"}
+  ]
+}
+```
+
+`outputs` and the legacy fields are mutually exclusive; mixing them returns a 400 error. Duplicate `(type, format_id)` pairs are rejected.
+
+### Status response
+
+`GET /api/status/<job_id>` returns the parent plus an `artifacts` array with per-output progress. For multi-output jobs the response includes `artifacts` and `current_artifact_id`:
+
+```json
+{
+  "status": "downloading",
+  "phase": "downloading",
+  "percent": 45.0,
+  "downloaded_bytes": 1048576,
+  "total_bytes": 8388608,
+  "speed": 524288,
+  "eta": 14,
+  "attempt": 1,
+  "max_attempts": 3,
+  "current_artifact_id": "a001",
+  "artifacts": [
+    {
+      "id": "a000", "type": "video", "format_id": "137",
+      "status": "done", "phase": "done", "percent": 100.0,
+      "filename": "Title (MP4 137).mp4", "attempt": 1, "max_attempts": 3
+    },
+    {
+      "id": "a001", "type": "audio", "format_id": null,
+      "status": "downloading", "phase": "downloading", "percent": 40.0,
+      "downloaded_bytes": 419430, "total_bytes": 1048576,
+      "speed": 524288, "eta": 1, "attempt": 1, "max_attempts": 3
+    }
+  ]
+}
+```
+
+Note that the parent's `status` stays `downloading` for the whole active run; the finer-grained stage is carried by `phase`, which mirrors the current artifact's active phase (see [Parent phases while active](#parent-phases-while-active)). Terminal parent phases are never overwritten.
+
+### Parent job statuses
+
+| Status | Meaning |
+| --- | --- |
+| `queued` | Waiting for a free worker slot. Reports a 1-based `queue_position`. |
+| `downloading` | The pipeline is running. Covers everything from claiming the job to the last artifact finishing; the current stage is reported by `phase`, not by `status`. |
+| `cancelling` | Cancellation was requested while running; the owning worker is terminating the subprocess and finalizing. |
+| `done` | Every artifact completed. |
+| `partial` | Some artifacts completed and some failed; completed outputs remain saveable. |
+| `error` | No artifact completed; the run failed. |
+| `cancelled` | The job was cancelled before or during the run. |
+| `timed_out` | The shared deadline expired before completion. |
+
+`starting` is a **phase**, not a parent status. A worker that has just claimed a job sets `status: "downloading"` together with `phase: "starting"`; there is no parent `status: "starting"`.
+
+### Parent phases while active
+
+While the parent is active (`status: "downloading"`), its `phase` mirrors the phase of the artifact currently running, so the UI can distinguish the stages within one download:
+
+| Phase | Meaning |
+| --- | --- |
+| `starting` | A worker claimed the job, or the next artifact's process is being spawned. |
+| `downloading` | The current artifact is actively transferring bytes. |
+| `retrying` | A transient failure on the current artifact is being retried. |
+| `processing` | Postprocessing (muxing/extraction) is running for the current artifact. |
+| `postprocessing` | Accepted for forward compatibility; the current pipeline reports this stage as `processing`. |
+
+Terminal parent phases are never overwritten: once a parent is `done`, `partial`, `error`, `cancelled`, or `timed_out`, a stale artifact phase cannot resurrect it as active.
+
+### Artifact statuses and phases
+
+| Status / phase | Meaning |
+| --- | --- |
+| `pending` | Artifact has not started yet. |
+| `starting` | yt-dlp/ffmpeg process is being spawned for this artifact. |
+| `downloading` | The artifact is actively downloading. |
+| `retrying` | A transient download failure is being retried. |
+| `processing` | Postprocessing (muxing/extraction) is running. |
+| `done` | The artifact finished and is saveable. |
+| `error` | The artifact failed permanently. |
+| `cancelled` | The artifact was cancelled. |
+| `timed_out` | The artifact did not finish before the deadline. |
+
+An artifact keeps `status: "downloading"` for the whole time it is active; its `phase` carries the finer-grained stage. The frontend renders each artifact from its own `status`/`phase` pair, so a completed artifact shows ✓ Complete with a Save button while a failed one shows ✗ Failed with none.
+
+### File endpoints
+
+- `GET /api/file/<job_id>/<artifact_id>` — download a specific artifact by id (e.g. `a000`). Available only when the parent is `done` or `partial` and the artifact itself is `done`.
+- `GET /api/file/<job_id>` — legacy single-output download. Returns 409 Conflict with a hint and the list of artifact ids if the job has multiple outputs.
+
+### Video-to-audio reuse
+
+When a request selects both video and audio, the pipeline runs video artifacts first. An audio artifact then attempts to extract its MP3 from an already-downloaded MP4 using ffmpeg (`try_ffmpeg_reuse`) instead of launching a fresh yt-dlp audio download. This avoids a second network fetch.
+
+A reuse attempt has exactly three outcomes, and they are kept strictly distinct:
+
+| Outcome | What happens | Falls back to a yt-dlp audio download? |
+| --- | --- | --- |
+| Success | The converted file is published atomically and the artifact becomes `done`. | Not needed |
+| Ordinary failure | ffmpeg exits non-zero, produces no output file, or the final publish (rename) fails with `OSError`. `try_ffmpeg_reuse` returns `False` and logs a warning. | **Yes** — the caller downloads the audio with yt-dlp, provided the parent is still active and time remains |
+| Cancellation or deadline expiry | The call raises: `PipelineCancelled` for a stop request, `subprocess.TimeoutExpired` when the parent's shared deadline is exhausted. The parent finalizes as `cancelled` or `timed_out`. | **No** — never |
+
+Only the ordinary-failure branch falls back. Not every publication error is fatal, and not every fatal outcome is a publication error: what makes cancellation and deadline expiry fatal is that spawning a fresh download for a job the user already stopped, or whose time budget is already spent, is exactly the bug this separation prevents. When a stop request and an expired deadline are both true, cancellation wins and the parent reports `cancelled`.
+
+### Shared parent deadline
+
+All artifacts in a parent share a single deadline computed once at pipeline start (`time.monotonic() + LINKSIFT_DOWNLOAD_TIMEOUT`). Each artifact checks the remaining budget before it begins; if the deadline has expired, the artifact is marked `timed_out`. Cancellation and deadline expiry are checked separately and in that order: when both are true, cancellation wins. A timed-out parent cleans up every artifact's files, including completed ones.
+
+### One parent, one queue entry, one slot, sequential execution
+
+A multi-output job is a single unit of scheduling. It occupies one queue entry while waiting and one `LINKSIFT_MAX_CONCURRENT_DOWNLOADS` worker slot while running. Artifacts execute strictly sequentially within that one worker. The subprocess registry is parent-keyed with identity-checked eviction, so a slow unwind of one artifact can never evict the process entry the next artifact registers under the same parent id.
+
+### Cancellation and cleanup
+
+- `DELETE /api/download/<job_id>` requests cancellation. A queued job is removed before any worker owns it; a running job transitions to `cancelling` while the owning worker terminates the subprocess tree.
+- On cancellation, every non-terminal artifact is marked `cancelled` and all artifact files (including completed ones) are removed.
+- On timeout, every non-terminal artifact is marked `timed_out` and all files are removed.
+- File serving (`/api/file/<job_id>/<artifact_id>`) is gated on the parent being `done` or `partial`, so files cleaned by cancellation or timeout cannot be served even if a stray file lingers on disk.
+
+### Configuration: LINKSIFT_MAX_OUTPUTS_PER_JOB
+
+`LINKSIFT_MAX_OUTPUTS_PER_JOB` caps how many outputs a single request may declare. Default `4`; valid range `1..8`; values greater than 8 are clamped to 8; missing, malformed, zero, or negative values fall back to the default. A request whose `outputs` array exceeds the limit is rejected with a 400 error.
+
+```yaml
+# docker-compose.yml override example
+services:
+  linksift:
+    environment:
+      - LINKSIFT_MAX_OUTPUTS_PER_JOB=6
+```
+
+### Local-first limits
+
+Multi-output does not add concurrency. The parent still holds one worker slot and runs its artifacts one at a time, so the total resource ceiling is unchanged: up to `LINKSIFT_MAX_CONCURRENT_DOWNLOADS` parent jobs active at once, each running one subprocess, bounded by `LINKSIFT_MAX_QUEUED_DOWNLOADS` waiting. The shared deadline and per-artifact retry budget keep total work within the existing `LINKSIFT_DOWNLOAD_TIMEOUT` envelope. No accounts, no external storage, no network fan-out — the only new bound is how many outputs one request can name.
 
 ## YouTube reliability
 

@@ -48,7 +48,7 @@ class SchedulerStartupFailureTests(unittest.TestCase):
     def test_startup_failure_returns_503_without_orphans(self):
         with patch.object(app, "DownloadScheduler", self._failing_ctor({1})), patch.object(
             app, "runtime_unavailable_response", return_value=None
-        ), patch.object(app, "run_download") as run:
+        ), patch.object(app, "run_pipeline") as run:
             response = self.client.post("/api/download", json={"url": "https://example.test/video"})
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.get_json(), {"error": "Download scheduler is unavailable"})
@@ -77,7 +77,7 @@ class SchedulerStartupFailureTests(unittest.TestCase):
 
         executed = threading.Event()
         with patch.object(
-            app, "run_download", side_effect=lambda *args, **kwargs: executed.set()
+            app, "run_pipeline", side_effect=lambda *args, **kwargs: executed.set()
         ), patch.object(app, "runtime_unavailable_response", return_value=None):
             second = self.client.post("/api/download", json={"url": "https://example.test/video"})
             self.assertEqual(second.status_code, 200)

@@ -258,6 +258,24 @@
     .error-details[open] summary::after { transform: rotate(180deg); }
     .error-details p { margin: 8px 0 0; font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere; }
 
+    /* ---------- Multi-output artifacts ---------- */
+    .artifact-list { margin-top: 12px; border-top: 1px solid var(--line-soft); padding-top: 12px; }
+    .artifact-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
+    .artifact-item:last-child { border-bottom: none; }
+    .artifact-info { flex: 1; min-width: 0; }
+    .artifact-label { font-size: 13px; color: var(--text); font-weight: 500; }
+    .artifact-status { font-size: 12px; color: var(--muted); font-family: var(--font-mono); margin-top: 2px; }
+    .artifact-status.done { color: var(--success); }
+    .artifact-status.error { color: var(--danger); }
+    .artifact-status.downloading { color: var(--accent); }
+    .artifact-status.cancelled { color: var(--muted); }
+    .artifact-status.timed-out { color: var(--danger); }
+    .artifact-status.pending { color: var(--muted); }
+    .artifact-progress { width: 60px; height: 4px; background: var(--surface); border-radius: 2px; overflow: hidden; margin-top: 4px; }
+    .artifact-progress-fill { height: 100%; background: var(--accent); transition: width var(--motion-base); }
+    .artifact-actions { flex-shrink: 0; }
+    .artifact-save-btn { padding: 4px 12px; font-size: 12px; min-height: 28px; }
+
     .queue-placeholder { display: flex; align-items: center; gap: 14px; border: 1px dashed var(--line); border-radius: var(--radius-lg); padding: 24px; color: var(--muted); font-size: 14px; }
     .queue-placeholder svg { flex: 0 0 auto; opacity: .7; }
     .queue-placeholder p { margin: 0; max-width: 52ch; }
@@ -896,7 +914,16 @@
       const isDone = card.status === 'done';
       const isError = card.status === 'error';
 
-      if ((isDownloading || isQueued) && (previousStatus === 'downloading' || previousStatus === 'queued')) {
+      // Fast path: when only numeric progress changed, patch the progress bar
+      // in place instead of rebuilding the card. The artifact signature guards
+      // multi-output jobs: if an artifact's status/percent/save state changed we
+      // fall through to a full render so per-artifact Save buttons appear.
+      // Every field an artifact row RENDERS must be in the signature (see
+      // artifactSignature). A phase change (downloading -> retrying) leaves
+      // status and percent untouched, so omitting phase pinned the row on a
+      // stale label.
+      const artSig = artifactSignature(card);
+      if ((isDownloading || isQueued) && (previousStatus === 'downloading' || previousStatus === 'queued') && element.dataset.artSig === artSig) {
         const wrap = element.querySelector('.progress-wrap');
         if (wrap) {
           updateProgressWrap(wrap, card);
@@ -904,10 +931,64 @@
         }
       }
 
-      const formatLabel = card.downloadFormat === 'audio' || (!card.downloadFormat && currentFormat === 'audio') ? 'MP3 audio' : 'MP4 video';
-      const qualityChips = !isDownloading && !isQueued && !isCancelling && !isDone && card.formats?.length > 1
-        ? card.formats.map((format, formatIndex) => `<button type="button" class="chip quality" data-format-index="${formatIndex}" aria-pressed="${String(format.id === card.selectedFormatId)}">${esc(format.label)}</button>`).join('')
-        : '';
+      // Build output selection chips for ready cards
+      const isReady = card.status === 'ready';
+      let outputChips = '';
+      if (isReady && card.outputOptions && card.outputOptions.length > 0) {
+        outputChips = card.outputOptions.map((opt, idx) => {
+          const isSelected = card.selectedOutputs.some(sel =>
+            sel.type === opt.type && sel.format_id === opt.format_id
+          );
+          const label = opt.label || (opt.type === 'audio' ? 'Audio' : `Video ${opt.format_id}`);
+          return `<button type="button" class="chip quality${isSelected ? ' selected' : ''}" data-output-index="${idx}">${esc(label)}</button>`;
+        }).join('');
+      }
+
+      // Build artifact list for multi-output jobs. Each completed artifact gets
+      // its own Save button so save state is tracked independently per output;
+      // the parent-level Save action only fans out to these same calls. Single-
+      // output jobs (one artifact) keep the legacy UI and the /api/file/<job>
+      // endpoint, so the list renders only when there is more than one output.
+      let artifactListHtml = '';
+      if (card.artifacts && card.artifacts.length > 1) {
+        artifactListHtml = '<div class="artifact-list">';
+        card.artifacts.forEach((art, idx) => {
+          const artState = artifactDisplayState(art);
+          const statusClass = artState.cls;
+          const statusText = artState.text;
+          const progressPct = art.percent || 0;
+          const saveLabel = art.saving ? 'Saving…' : art.saved ? '✓ Saved' : art.saveError ? 'Retry save' : 'Save';
+          const saveDisabled = art.saving || art.saved;
+          artifactListHtml += `
+            <div class="artifact-item">
+              <div class="artifact-info">
+                <div class="artifact-label">${esc(art.label || (art.type === 'audio' ? 'Audio' : `Video ${art.format_id}`))}</div>
+                <div class="artifact-status ${statusClass}">${statusText}${art.saved ? ' · saved' : ''}${art.saveError ? ` · ${esc(art.saveError)}` : ''}</div>
+                ${artState.showProgress ? `<div class="artifact-progress"><div class="artifact-progress-fill" style="width: ${progressPct}%"></div></div>` : ''}
+              </div>
+              ${artState.canSave ? `<div class="artifact-actions"><button type="button" class="artifact-save-btn" data-artifact-save="${idx}"${saveDisabled ? ' disabled' : ''}>${saveLabel}</button></div>` : ''}
+            </div>
+          `;
+        });
+        artifactListHtml += '</div>';
+      }
+
+      // Format label for single-output or summary for multi-output
+      let formatLabel;
+      if (card.selectedOutputs && card.selectedOutputs.length > 1) {
+        const videoCount = card.selectedOutputs.filter(o => o.type === 'video').length;
+        const audioCount = card.selectedOutputs.filter(o => o.type === 'audio').length;
+        const parts = [];
+        if (videoCount > 0) parts.push(`${videoCount} video${videoCount > 1 ? 's' : ''}`);
+        if (audioCount > 0) parts.push('audio');
+        formatLabel = parts.join(' + ');
+      } else if (card.selectedOutputs && card.selectedOutputs.length === 1) {
+        const sel = card.selectedOutputs[0];
+        formatLabel = sel.type === 'audio' ? 'MP3 audio' : `MP4 video ${sel.format_id || ''}`.trim();
+      } else {
+        formatLabel = card.downloadFormat === 'audio' || (!card.downloadFormat && currentFormat === 'audio') ? 'MP3 audio' : 'MP4 video';
+      }
+
       let statusHtml = '';
       if (isDownloading || isQueued) {
         const parts = progressParts(card);
@@ -923,7 +1004,10 @@
         statusHtml = '<span class="status-line">Cancelled</span>';
       } else if (isTimedOut) {
         statusHtml = `<span class="status-line error">${esc(card.error || 'Download timed out')}</span>`;
+      } else if (card.status === 'partial') {
+        statusHtml = `<span class="status-line error">Partial: some outputs failed</span>`;
       }
+
       const action = (isDownloading || isQueued)
         ? `${statusHtml}<button type="button" class="retry-btn" data-cancel="true">Cancel</button>`
         : isCancelling ? statusHtml : isDone
@@ -932,28 +1016,62 @@
           ? `<button type="button" class="retry-btn" data-download="true">Retry download</button>${statusHtml}`
           : isCancelled
             ? `<button type="button" class="retry-btn" data-download="true">Download again</button>${statusHtml}`
-            : `<button type="button" class="download-btn" data-download="true">${downloadDirectoryHandle ? `Save to ${esc(downloadDirectoryHandle.name)}` : 'Download'}</button>`;
+            : card.status === 'partial'
+              ? `<button type="button" class="retry-btn" data-save="true">Save completed outputs</button>${statusHtml}`
+              : `<button type="button" class="download-btn" data-download="true">${downloadDirectoryHandle ? `Save to ${esc(downloadDirectoryHandle.name)}` : 'Download'}</button>`;
       const thumbnail = card.thumbnail ? '<img alt="">' : '<span aria-hidden="true">⌁</span>';
 
       const active = document.activeElement;
       const refocusSelector = element.contains(active)
-        ? (active.dataset.formatIndex !== undefined ? `[data-format-index="${active.dataset.formatIndex}"]`
+        ? (active.dataset.outputIndex !== undefined ? `[data-output-index="${active.dataset.outputIndex}"]`
+          : active.dataset.formatIndex !== undefined ? `[data-format-index="${active.dataset.formatIndex}"]`
+          : active.hasAttribute('data-artifact-save') ? `[data-artifact-save="${active.dataset.artifactSave}"]`
           : active.hasAttribute('data-download') ? '[data-download]'
           : active.hasAttribute('data-save') ? '[data-save]'
           : active.hasAttribute('data-cancel') ? '[data-cancel]'
           : null)
         : null;
 
-      element.innerHTML = `<div class="card-thumb">${thumbnail}</div><div class="card-body"><h3 class="card-title">${esc(card.title || 'Untitled')}</h3><div class="card-meta">${esc(card.uploader || '')}${card.uploader && card.duration ? ' · ' : ''}${card.duration ? fmtDur(card.duration) : ''}</div><div class="chips"><span class="chip chip-static">${formatLabel}</span>${qualityChips}</div></div><div class="card-actions">${action}</div>`;
+      const chipsHtml = isReady && outputChips ? outputChips : `<span class="chip chip-static">${formatLabel}</span>`;
+      element.innerHTML = `<div class="card-thumb">${thumbnail}</div><div class="card-body"><h3 class="card-title">${esc(card.title || 'Untitled')}</h3><div class="card-meta">${esc(card.uploader || '')}${card.uploader && card.duration ? ' · ' : ''}${card.duration ? fmtDur(card.duration) : ''}</div><div class="chips">${chipsHtml}</div>${artifactListHtml}</div><div class="card-actions">${action}</div>`;
+      // Stamp the artifact signature so the next poll's fast-path can tell when
+      // an artifact changed (status/percent/save state) and fall through to a
+      // full render instead of skipping the artifact list.
+      element.dataset.artSig = artSig;
       const image = element.querySelector('.card-thumb img');
       if (image) image.src = card.thumbnail;
+
+      // Bind output selection chips
+      element.querySelectorAll('[data-output-index]').forEach(button => button.addEventListener('click', () => {
+        const idx = Number(button.dataset.outputIndex);
+        const opt = card.outputOptions[idx];
+        const existingIdx = card.selectedOutputs.findIndex(sel =>
+          sel.type === opt.type && sel.format_id === opt.format_id
+        );
+        if (existingIdx >= 0) {
+          card.selectedOutputs.splice(existingIdx, 1);
+        } else {
+          card.selectedOutputs.push(opt);
+        }
+        renderCard(index);
+      }));
+
+      // Bind legacy format chips (backward compat)
       element.querySelectorAll('[data-format-index]').forEach(button => button.addEventListener('click', () => {
         card.selectedFormatId = card.formats[Number(button.dataset.formatIndex)].id;
         renderCard(index);
       }));
+
       element.querySelector('[data-download]')?.addEventListener('click', () => dlCard(index));
       element.querySelector('[data-save]')?.addEventListener('click', () => saveCard(index, true));
       element.querySelector('[data-cancel]')?.addEventListener('click', () => cancelCard(index));
+
+      // Per-artifact Save buttons (multi-output only). Each invokes saveArtifact
+      // with that artifact's index, so save state stays per-artifact, not per-card.
+      element.querySelectorAll('[data-artifact-save]').forEach(button => button.addEventListener('click', () => {
+        const artifactIdx = Number(button.dataset.artifactSave);
+        saveArtifact(index, artifactIdx);
+      }));
 
       if (refocusSelector) {
         const target = element.querySelector(refocusSelector);
@@ -1005,15 +1123,38 @@
         }
         for (const url of urls) {
           const index = cardData.length;
-          cardData.push({ url, status: 'loading' });
+          cardData.push({ url, status: 'loading', selectedOutputs: [] });
           renderCard(index);
           updateManifest();
           try {
             const response = await fetch('/api/info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
             const data = await response.json();
-            cardData[index] = !response.ok || data.error
-              ? { ...cardData[index], status: 'info-error', error: data.error || 'Could not inspect media' }
-              : { ...cardData[index], status: 'ready', title: data.title || '', thumbnail: data.thumbnail || '', duration: data.duration, uploader: data.uploader || '', formats: data.formats || [], selectedFormatId: data.formats?.[0]?.id || null };
+            if (!response.ok || data.error) {
+              cardData[index] = { ...cardData[index], status: 'info-error', error: data.error || 'Could not inspect media' };
+            } else {
+              const formats = data.formats || [];
+              // Build output options: video formats + audio
+              const outputOptions = [
+                ...formats.map(f => ({ type: 'video', format_id: f.id, label: f.label })),
+                { type: 'audio', label: 'Audio only' }
+              ];
+              // Default selection: first video + audio (or just first available)
+              const defaultOutputs = formats.length > 0
+                ? [{ type: 'video', format_id: formats[0].id }, { type: 'audio' }]
+                : [{ type: 'audio' }];
+              cardData[index] = {
+                ...cardData[index],
+                status: 'ready',
+                title: data.title || '',
+                thumbnail: data.thumbnail || '',
+                duration: data.duration,
+                uploader: data.uploader || '',
+                formats: formats,
+                outputOptions: outputOptions,
+                selectedOutputs: defaultOutputs,
+                selectedFormatId: formats[0]?.id || null
+              };
+            }
           } catch (err) {
             cardData[index] = { ...cardData[index], status: 'info-error', error: err.message || 'Could not inspect media' };
           }
@@ -1044,18 +1185,56 @@
     async function dlCard(index) {
       const card = cardData[index];
       if (!card || isActiveStatus(card.status)) return;
+
+      // Validate outputs
+      const outputs = card.selectedOutputs || [];
+      if (outputs.length === 0) {
+        alert('Please select at least one output format.');
+        return;
+      }
+
       const launchToken = ++downloadLaunchCounter;
-      Object.assign(card, { status: 'downloading', phase: 'starting', downloadedBytes: 0, totalBytes: null, speed: null, eta: null, percent: null, queuePosition: null, reconnecting: 0, error: null, saved: false, savedToBrowser: false, saving: false, savedToFolder: null, downloadFormat: currentFormat, jobId: null, launchToken, cancelRequested: false });
+      Object.assign(card, {
+        status: 'downloading',
+        phase: 'starting',
+        downloadedBytes: 0,
+        totalBytes: null,
+        speed: null,
+        eta: null,
+        percent: null,
+        queuePosition: null,
+        reconnecting: 0,
+        error: null,
+        saved: false,
+        savedToBrowser: false,
+        saving: false,
+        savedToFolder: null,
+        artifacts: [],
+        jobId: null,
+        launchToken,
+        cancelRequested: false
+      });
       document.documentElement.dataset.activity = 'downloading';
       renderCard(index);
       updateManifest();
+
       let data;
       try {
-        const response = await fetch('/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: card.url, format: card.downloadFormat, format_id: card.selectedFormatId, title: card.title || '' }) });
+        const requestBody = outputs.length === 1 && outputs[0].type === 'video' && outputs[0].format_id
+          ? { url: card.url, format: 'video', format_id: outputs[0].format_id, title: card.title || '' }
+          : outputs.length === 1 && outputs[0].type === 'audio'
+          ? { url: card.url, format: 'audio', title: card.title || '' }
+          : { url: card.url, outputs: outputs, title: card.title || '' };
+
+        const response = await fetch('/api/download', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody)
+        });
         data = await response.json();
         if (!response.ok || data.error) throw new Error(data.error || 'Could not start download');
       } catch (err) {
-        if (isStaleLaunch(card, index, launchToken)) return; // A stale request must never touch the card now at this index.
+        if (isStaleLaunch(card, index, launchToken)) return;
         if (card.cancelRequested) {
           Object.assign(card, { status: 'cancelled', error: null });
           settleIdleActivity();
@@ -1068,8 +1247,9 @@
         updateManifest();
         return;
       }
+
       if (isStaleLaunch(card, index, launchToken) || card.cancelRequested) {
-        cancelJobOnServer(data.job_id); // The job id arrived too late: cancel it server-side, best-effort.
+        cancelJobOnServer(data.job_id);
         if (!isStaleLaunch(card, index, launchToken)) {
           Object.assign(card, { status: 'cancelled', error: null });
           settleIdleActivity();
@@ -1078,6 +1258,7 @@
         }
         return;
       }
+
       card.jobId = data.job_id;
       pollCard(index, card);
     }
@@ -1094,14 +1275,77 @@
           if (!response.ok) throw new Error(data.error || 'Status check failed');
           failures = 0;
           card.reconnecting = 0;
-          Object.assign(card, { phase: data.phase, downloadedBytes: data.downloaded_bytes, totalBytes: data.total_bytes, speed: data.speed, eta: data.eta, percent: data.percent, queuePosition: data.queue_position, attempt: data.attempt, maxAttempts: data.max_attempts });
+
+          // The server always sends an artifacts array once planning runs, even
+          // for single-output jobs (length 1). Treat length > 1 as multi-output;
+          // a single-element array is the legacy single-output path, which keeps
+          // the /api/file/<job> endpoint and the plain progress UI.
+          const isMulti = Array.isArray(data.artifacts) && data.artifacts.length > 1;
+
+          // Scalar progress fields are present for every job (the server folds
+          // aggregate progress into them for multi-output), so update them first.
+          Object.assign(card, {
+            phase: data.phase,
+            downloadedBytes: data.downloaded_bytes,
+            totalBytes: data.total_bytes,
+            speed: data.speed,
+            eta: data.eta,
+            percent: data.percent,
+            queuePosition: data.queue_position,
+            attempt: data.attempt,
+            maxAttempts: data.max_attempts
+          });
+
+          if (isMulti) {
+            // Server artifacts carry no client save state. Merge them with the
+            // previous per-artifact saved/saving flags by id, mutating the
+            // existing objects in place (Object.assign) so references held
+            // across an await in saveArtifact stay valid — a fresh poll must
+            // never reset a Save that just completed, and must never strand a
+            // save-in-progress on an orphaned object.
+            const previous = {};
+            (card.artifacts || []).forEach(a => { previous[a.id] = a; });
+            card.artifacts = data.artifacts.map(a => {
+              const old = previous[a.id];
+              if (old) {
+                Object.assign(old, a);
+                return old;
+              }
+              a.saved = false;
+              a.saving = false;
+              a.savedToFolder = null;
+              a.savedToBrowser = false;
+              a.saveError = null;
+              return a;
+            });
+          } else {
+            // Legacy single-output: no per-artifact UI or per-artifact save.
+            card.artifacts = null;
+          }
+
           if (data.status === 'done') {
             pollControllers.delete(card.jobId);
-            Object.assign(card, { status: 'done', filename: data.filename });
+            Object.assign(card, { status: 'done' });
+            // Single-output filename comes from the top-level payload (the
+            // server mirrors artifacts[0].filename there for legacy clients).
+            if (!isMulti) {
+              card.filename = data.filename || card.filename;
+            }
             document.documentElement.dataset.activity = 'success';
             renderCard(index);
             updateManifest();
-            if (!card.saved && !card.saving) saveCard(index);
+            // Auto-save only for single-output jobs; multi-output waits for the
+            // user to pick which completed artifacts to save.
+            if (!isMulti && !card.saved && !card.saving) {
+              saveCard(index);
+            }
+            return;
+          }
+          if (data.status === 'partial') {
+            pollControllers.delete(card.jobId);
+            Object.assign(card, { status: 'partial', error: 'Some outputs failed' });
+            renderCard(index);
+            updateManifest();
             return;
           }
           if (data.status === 'error') {
@@ -1163,9 +1407,140 @@
       throw new Error('Could not find an available filename');
     }
 
+    // Recompute a multi-output card's aggregated save state from its artifacts.
+    // Called whenever a per-artifact save settles so card.saved / card.savedToFolder
+    // converge even when artifacts were saved one at a time or out of order.
+    // Single source of truth for how ONE artifact row is displayed.
+    //
+    // The previous inline expression mapped only done/error/downloading and let
+    // everything else fall through to 'Pending'. A retrying artifact therefore
+    // read 'Downloading...', and processing / cancelled / timed_out all read
+    // 'Pending' - three different outcomes shown as 'not started yet'.
+    //
+    // status is the coarse state; phase refines it while the artifact is active
+    // (status stays 'downloading' across a retry, only phase moves). Terminal
+    // statuses are decided by status alone and ignore any stale phase.
+    // Pure signature of an artifact list: every field the row renders. The
+    // fast path in renderCard compares this against element.dataset.artSig to
+    // decide whether a numeric-only patch is enough or a full rerender is
+    // needed. Extracted as a function so it is unit-testable in Node.
+    function artifactSignature(card) {
+      if (!card.artifacts || card.artifacts.length <= 1) return '';
+      return card.artifacts.map(a => `${a.id}:${a.status}:${a.phase || ''}:${a.percent | 0}:${a.saved ? 1 : 0}:${a.saving ? 1 : 0}:${a.saveError ? 1 : 0}`).join('|');
+    }
+
+    function artifactDisplayState(art) {
+      const status = art && art.status;
+      const phase = art && art.phase;
+
+      if (status === 'done') return { text: '✓ Complete', cls: 'done', canSave: true, showProgress: false };
+      if (status === 'error') return { text: '✗ Failed', cls: 'error', canSave: false, showProgress: false };
+      if (status === 'cancelled') return { text: 'Cancelled', cls: 'cancelled', canSave: false, showProgress: false };
+      if (status === 'timed_out') return { text: 'Timed out', cls: 'timed-out', canSave: false, showProgress: false };
+
+      // Active artifact: phase is the more specific signal, so it wins.
+      // `starting` MUST come before `downloading`: while an artifact is active
+      // its status stays 'downloading' for the whole run, so `status ===
+      // 'downloading'` would otherwise swallow the brief `starting` phase and
+      // the row would read "Downloading…" before any bytes had flowed.
+      if (phase === 'retrying' || status === 'retrying') {
+        return { text: 'Retrying…', cls: 'downloading', canSave: false, showProgress: true };
+      }
+      if (phase === 'processing' || phase === 'postprocessing' || status === 'processing') {
+        return { text: 'Processing…', cls: 'downloading', canSave: false, showProgress: false };
+      }
+      if (phase === 'starting' || status === 'starting') {
+        return { text: 'Starting…', cls: 'downloading', canSave: false, showProgress: false };
+      }
+      if (phase === 'downloading' || status === 'downloading') {
+        return { text: 'Downloading…', cls: 'downloading', canSave: false, showProgress: true };
+      }
+      return { text: 'Pending', cls: 'pending', canSave: false, showProgress: false };
+    }
+
+    function syncCardSaveState(card) {
+      if (!Array.isArray(card.artifacts) || card.artifacts.length === 0) return;
+      const doneArts = card.artifacts.filter(a => a.status === 'done');
+      if (doneArts.length === 0) return;
+      card.saved = doneArts.every(a => a.saved);
+      card.savedToFolder = doneArts.some(a => a.savedToFolder)
+        ? (downloadDirectoryHandle ? downloadDirectoryHandle.name : null)
+        : null;
+    }
+
+    async function saveArtifact(index, artifactIdx, force = false) {
+      const card = cardData[index];
+      if (!card?.jobId || !Array.isArray(card.artifacts)) return;
+      const art = card.artifacts[artifactIdx];
+      if (!art || art.status !== 'done' || art.saving || (art.saved && !force)) return;
+      // Reset prior save state before re-saving so the UI reflects a fresh write.
+      if (force) {
+        art.saved = false;
+        art.savedToFolder = null;
+        art.savedToBrowser = false;
+        art.saveError = null;
+      }
+      art.saving = true;
+      art.saveError = null;
+      if (cardData[index] === card) renderCard(index);
+      try {
+        if (await selectedFolderHasPermission()) {
+          const response = await fetch(`/api/file/${card.jobId}/${art.id}`);
+          if (!response.ok || !response.body) throw new Error('File is not ready');
+          const handle = await uniqueFileHandle(downloadDirectoryHandle, art.filename || 'download');
+          const writable = await handle.createWritable();
+          await response.body.pipeTo(writable);
+          art.savedToFolder = downloadDirectoryHandle.name;
+          art.savedToBrowser = false;
+          art.saved = true;
+        } else {
+          if (downloadDirectoryHandle) useBrowserDownloads();
+          const anchor = document.createElement('a');
+          anchor.href = `/api/file/${card.jobId}/${art.id}`;
+          anchor.download = art.filename || '';
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+          art.savedToBrowser = true;
+          art.savedToFolder = null;
+          art.saved = true;
+        }
+      } catch (err) {
+        art.saveError = err.message || 'Could not save file';
+      } finally {
+        art.saving = false;
+        syncCardSaveState(card);
+        if (cardData[index] === card) { renderCard(index); updateManifest(); }
+      }
+    }
+
     async function saveCard(index, force = false) {
       const card = cardData[index];
       if (!card?.jobId || card.saving || (card.saved && !force)) return;
+
+      // Multi-output: the parent endpoint /api/file/<job> answers 409 for jobs
+      // with more than one output, so save each completed artifact individually.
+      // This is also the path the "Save completed outputs" partial action takes.
+      if (Array.isArray(card.artifacts) && card.artifacts.length > 1) {
+        const targets = card.artifacts
+          .map((a, i) => ({ a, i }))
+          .filter(({ a }) => a.status === 'done' && (!a.saved || force));
+        if (targets.length === 0) return;
+        card.saving = true;
+        if (cardData[index] === card) renderCard(index);
+        try {
+          for (const { i } of targets) {
+            await saveArtifact(index, i, force);
+          }
+          syncCardSaveState(card);
+        } finally {
+          card.saving = false;
+          if (cardData[index] === card) { renderCard(index); updateManifest(); }
+        }
+        return;
+      }
+
+      // Single-output (legacy) path: one file, one endpoint, one save state.
       card.saving = true;
       try {
         if (await selectedFolderHasPermission()) {

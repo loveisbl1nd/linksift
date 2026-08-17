@@ -35,7 +35,9 @@ class DownloadTimeoutTests(unittest.TestCase):
                 side_effect=app.subprocess.TimeoutExpired(cmd=["yt-dlp"], timeout=3600),
             ) as run:
                 app.run_download(job_id, "https://example.com/video", "video", None)
-            self.assertEqual(run.call_args.args[2], 3600)
+            # Signature: run_download_command(cmd, parent_job_id, progress_target, timeout)
+            # timeout is at index 3
+            self.assertEqual(run.call_args.args[3], 3600)
             command = run.call_args.args[0]
             self.assertIn("--progress-template", command)
             self.assertIn(f"download:{app.PROGRESS_PREFIX}%(progress)j", command)

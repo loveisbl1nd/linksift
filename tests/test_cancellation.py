@@ -59,7 +59,7 @@ class CancelEndpointTests(unittest.TestCase):
         job_id = "cancelrun2"
         app.jobs[job_id] = {"status": "downloading", "title": ""}
 
-        def killed_mid_run(cmd, job, timeout):
+        def killed_mid_run(cmd, parent_job_id, job, timeout):
             with app.jobs_lock:
                 job["cancel_requested"] = True
                 job["status"] = "cancelling"
@@ -94,7 +94,7 @@ class CancelEndpointTests(unittest.TestCase):
             partial.write_bytes(b"partial")
             app.jobs[job_id] = {"status": "downloading", "title": ""}
 
-            def cancel_mid_run(cmd, job, timeout):
+            def cancel_mid_run(cmd, parent_job_id, job, timeout):
                 with app.jobs_lock:
                     job["cancel_requested"] = True
                     job["status"] = "cancelling"
@@ -109,7 +109,9 @@ class CancelEndpointTests(unittest.TestCase):
 
     def test_process_registry_cleared_after_completion(self):
         job_id = "registryjb"
-        job = {"id": job_id, "status": "downloading"}
+        parent_job_id = "parent123"
+        job = {"id": parent_job_id, "status": "downloading"}
+        app.jobs[parent_job_id] = job
         observed = {}
 
         class FakeProcess:
@@ -118,12 +120,12 @@ class CancelEndpointTests(unittest.TestCase):
                 self.returncode = 0
 
             def wait(self, timeout):
-                observed["registered"] = app.processes.get(job_id)
+                observed["registered"] = app.processes.get(parent_job_id)
                 return self.returncode
 
         fake = FakeProcess()
         with patch.object(app.subprocess, "Popen", return_value=fake):
-            result = app.run_download_command(["yt-dlp", "url"], job, 60)
+            result = app.run_download_command(["yt-dlp", "url"], parent_job_id, job, 60)
 
         self.assertEqual(result.returncode, 0)
         self.assertIs(observed["registered"], fake)

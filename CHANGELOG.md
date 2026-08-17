@@ -4,6 +4,24 @@ All notable changes to LinkSift are documented here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-18
+
+### Added
+
+- Multi-output downloads: select multiple output formats for a single URL (e.g., MP4 + MP3). When you choose both video and audio, LinkSift automatically extracts audio from the downloaded video using ffmpeg, saving bandwidth and time. The UI displays per-artifact progress with individual save buttons for each completed output.
+- New `partial` job status for multi-output jobs where some outputs succeed and others fail, allowing users to save the completed outputs while retrying the failed ones.
+- Backend pipeline processes artifacts sequentially with a shared deadline and per-artifact retry logic; `/api/status/<job_id>` returns an `artifacts` array with individual progress for each output.
+
+### Changed
+
+- The parent `phase` now mirrors the current artifact's phase for every active phase (`starting`, `downloading`, `retrying`, `processing`), not just `retrying`/`processing`. Previously the parent sat on `starting` for the entire download of each artifact because a plain `downloading` artifact phase was not reflected. Terminal parent phases are never overwritten.
+- `LINKSIFT_MAX_OUTPUTS_PER_JOB` (default 4, range 1–8, clamped at 8) caps how many outputs one request may declare; requests exceeding the limit are rejected with a 400 error.
+
+### Fixed
+
+- Cancellation and deadline expiry before publishing an ffmpeg-reuse output are now checked separately. Previously both raised `PipelineCancelled`, so a timed-out parent was reported as `cancelled` and followed the cancellation cleanup path instead of the timeout path. Now cancellation raises `PipelineCancelled` and deadline expiry raises `subprocess.TimeoutExpired`; `run_pipeline` converts the latter into a `timed_out` parent, and cancellation still wins the race when both are true.
+- Unexpected exceptions out of `ffmpeg.communicate()` (e.g. `OSError`, `ValueError`) no longer leave a stale ffmpeg process behind. The `except` block now covers `BaseException`, reaps the process via the existing lifecycle helper, removes the temp output, and re-raises the original error without triggering the `return False` fallback path. The registry entry is evicted only if it still points at this process (identity check), so a slow unwind can never evict the next artifact's entry.
+
 ## [0.2.0] - 2026-08-14
 
 ### Added
@@ -58,6 +76,7 @@ All notable changes to LinkSift are documented here.
 - Playlist truncation is now detected from the raw yt-dlp entry count, so playlists containing unavailable entries still report `truncated` correctly; blank or malformed entries are skipped without failing the request.
 - Container startup now normalizes the entrypoint to LF line endings, including builds made from a Windows working tree.
 
-[Unreleased]: https://github.com/loveisbl1nd/linksift/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/loveisbl1nd/linksift/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/loveisbl1nd/linksift/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/loveisbl1nd/linksift/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/loveisbl1nd/linksift/releases/tag/v0.1.0

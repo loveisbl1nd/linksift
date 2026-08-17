@@ -10,6 +10,7 @@ assets/*.mov
 .env.production
 .env.development
 out_*.txt
+test_baseline.txt
 verify_*.py
 NUL
 .superpowers/

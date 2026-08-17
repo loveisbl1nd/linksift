@@ -127,7 +127,7 @@ class FreshRetryDownloadTests(unittest.TestCase):
             output = Path(temp_dir) / f"{job_id}.mp4"
             calls = []
 
-            def flaky(cmd, job, timeout):
+            def flaky(cmd, parent_job_id, job, timeout):
                 calls.append(list(cmd))
                 if len(calls) == 1:
                     return subprocess.CompletedProcess(cmd, 1, "", "ERROR: HTTP Error 403: Forbidden")
@@ -158,7 +158,7 @@ class FreshRetryDownloadTests(unittest.TestCase):
             partial.write_bytes(b"partial")
             calls = []
 
-            def always_403(cmd, job, timeout):
+            def always_403(cmd, parent_job_id, job, timeout):
                 calls.append(timeout)
                 return subprocess.CompletedProcess(cmd, 1, "", "ERROR: HTTP Error 403: Forbidden")
 
@@ -183,7 +183,7 @@ class FreshRetryDownloadTests(unittest.TestCase):
                 subprocess.CompletedProcess([], 1, "", "ERROR: HTTP Error 502: Bad Gateway"),
             ]
 
-            def flaky(cmd, job, timeout):
+            def flaky(cmd, parent_job_id, job, timeout):
                 if responses:
                     return responses.pop(0)
                 output.write_bytes(b"final")
@@ -203,7 +203,7 @@ class FreshRetryDownloadTests(unittest.TestCase):
                 app.jobs.clear()
                 calls = []
 
-                def permanent(cmd, job, timeout):
+                def permanent(cmd, parent_job_id, job, timeout):
                     calls.append(1)
                     return subprocess.CompletedProcess(cmd, 1, "", message)
 
@@ -227,7 +227,7 @@ class FreshRetryDownloadTests(unittest.TestCase):
             release.wait(timeout=10)
             return not job.get("cancel_requested")
 
-        def always_403(cmd, job, timeout):
+        def always_403(cmd, parent_job_id, job, timeout):
             calls.append(1)
             return subprocess.CompletedProcess(cmd, 1, "", "ERROR: HTTP Error 403: Forbidden")
 
@@ -268,7 +268,7 @@ class FreshRetryDownloadTests(unittest.TestCase):
         # platform regardless of the real clock's resolution.
         ticks = itertools.count()
 
-        def flaky(cmd, job, timeout):
+        def flaky(cmd, parent_job_id, job, timeout):
             timeouts.append(timeout)
             if len(timeouts) == 1:
                 return subprocess.CompletedProcess(cmd, 1, "", "ERROR: HTTP Error 403: Forbidden")
@@ -291,7 +291,7 @@ class FreshRetryDownloadTests(unittest.TestCase):
     def test_deadline_expiry_during_backoff_becomes_timed_out(self):
         job_id = "deadline02"
 
-        def always_403(cmd, job, timeout):
+        def always_403(cmd, parent_job_id, job, timeout):
             return subprocess.CompletedProcess(cmd, 1, "", "ERROR: HTTP Error 403: Forbidden")
 
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
@@ -317,7 +317,7 @@ class FreshRetryDownloadTests(unittest.TestCase):
         job_id = "racecncl01"
         calls = []
 
-        def first_403(cmd, job, timeout):
+        def first_403(cmd, parent_job_id, job, timeout):
             calls.append(1)
             return subprocess.CompletedProcess(cmd, 1, "", "ERROR: HTTP Error 403: Forbidden")
 
@@ -340,19 +340,21 @@ class FreshRetryDownloadTests(unittest.TestCase):
         self.assertEqual(app.jobs[job_id]["status"], "cancelled")
 
     def test_pre_spawn_gate_blocks_popen_when_cancelled(self):
+        parent_job_id = "parent123"
         job_id = "gated00001"
         job = {"id": job_id, "status": "cancelling", "cancel_requested": True}
-        app.jobs[job_id] = job
+        app.jobs[parent_job_id] = job
         with patch.object(app.subprocess, "Popen") as popen:
-            result = app.run_download_command(["yt-dlp", "url"], job, 60)
+            result = app.run_download_command(["yt-dlp", "url"], parent_job_id, job, 60)
         popen.assert_not_called()
         self.assertIsNone(result)
-        self.assertNotIn(job_id, app.processes)
+        self.assertNotIn(parent_job_id, app.processes)
 
     def test_delete_after_spawn_sees_registered_process(self):
+        parent_job_id = "parent123"
         job_id = "spawnrace1"
         job = {"id": job_id, "status": "downloading", "title": "", "cancel_requested": False}
-        app.jobs[job_id] = job
+        app.jobs[parent_job_id] = job
         started = threading.Event()
         release = threading.Event()
 
@@ -375,13 +377,13 @@ class FreshRetryDownloadTests(unittest.TestCase):
                 app, "terminate_process_tree"
             ) as terminate:
                 worker = threading.Thread(
-                    target=app.run_download_command, args=(["yt-dlp", "url"], job, 60)
+                    target=app.run_download_command, args=(["yt-dlp", "url"], parent_job_id, job, 60)
                 )
                 worker.start()
                 self.assertTrue(started.wait(timeout=5))
                 with app.jobs_lock:
-                    self.assertIs(app.processes.get(job_id), fake)
-                response = self.client.delete(f"/api/download/{job_id}")
+                    self.assertIs(app.processes.get(parent_job_id), fake)
+                response = self.client.delete(f"/api/download/{parent_job_id}")
                 self.assertEqual(response.get_json()["status"], "cancelling")
                 terminate.assert_called_once_with(fake)
                 release.set()
@@ -400,7 +402,7 @@ class FreshRetryDownloadTests(unittest.TestCase):
             release.wait(timeout=10)
             return not job.get("cancel_requested")
 
-        def always_403(cmd, job, timeout):
+        def always_403(cmd, parent_job_id, job, timeout):
             return subprocess.CompletedProcess(cmd, 1, "", "ERROR: HTTP Error 403: Forbidden")
 
         try:

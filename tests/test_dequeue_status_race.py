@@ -64,14 +64,14 @@ class DequeueStatusRaceTests(unittest.TestCase):
         first_running = threading.Event()
         executed = []
 
-        def fake_run_download(job_id, url, format_choice, format_id):
+        def fake_run_pipeline(job_id, url, title):
             executed.append(job_id)
             first_running.set()
             release.wait(timeout=10)
 
         try:
             with patch.dict(os.environ, {"LINKSIFT_MAX_CONCURRENT_DOWNLOADS": "1"}), patch.object(
-                app, "run_download", side_effect=fake_run_download
+                app, "run_pipeline", side_effect=fake_run_pipeline
             ), patch.object(app, "runtime_unavailable_response", return_value=None):
                 app.reset_scheduler()
                 first = self.client.post("/api/download", json={"url": "https://example.test/v1"})
@@ -118,13 +118,13 @@ class DequeueStatusRaceTests(unittest.TestCase):
             lock_was_free.append(acquired)
             return real_claim(job_id)
 
-        def fake_run_download(job_id, url, format_choice, format_id):
+        def fake_run_pipeline(job_id, url, title):
             running.set()
             release.wait(timeout=10)
 
         try:
             with patch.object(app, "claim_download_job", side_effect=recording_claim), patch.object(
-                app, "run_download", side_effect=fake_run_download
+                app, "run_pipeline", side_effect=fake_run_pipeline
             ), patch.object(app, "runtime_unavailable_response", return_value=None):
                 app.reset_scheduler()
                 self.assertIs(app.get_scheduler()._claim_lock, app.jobs_lock)
@@ -142,7 +142,7 @@ class DequeueStatusRaceTests(unittest.TestCase):
         in_command = threading.Event()
         release = threading.Event()
 
-        def blocked_command(cmd, job, timeout):
+        def blocked_command(cmd, parent_job_id, job, timeout):
             in_command.set()
             release.wait(timeout=10)
             return subprocess.CompletedProcess(cmd, 1, "", "")

@@ -87,10 +87,10 @@ class QueueCancellationTests(unittest.TestCase):
         job_id = "beats00001"
         app.jobs[job_id] = {"id": job_id, "status": "downloading", "title": ""}
 
-        def cancel_then_timeout(cmd, job, timeout):
+        def cancel_then_timeout(cmd, parent_job_id, progress_target, timeout):
             with app.jobs_lock:
-                job["cancel_requested"] = True
-                job["status"] = "cancelling"
+                progress_target["cancel_requested"] = True
+                progress_target["status"] = "cancelling"
             raise app.subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
 
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(

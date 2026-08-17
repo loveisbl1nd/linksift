@@ -61,7 +61,7 @@ class ApiClaimErrorTests(unittest.TestCase):
                 raise RuntimeError("boom-internal-detail")
             return real_claim(job_id)
 
-        def fake_run_download(job_id, url, format_choice, format_id):
+        def fake_run_pipeline(job_id, url, title):
             executed.append(job_id)
             second_running.set()
             release.wait(timeout=10)
@@ -69,7 +69,7 @@ class ApiClaimErrorTests(unittest.TestCase):
         try:
             with patch.dict(os.environ, {"LINKSIFT_MAX_CONCURRENT_DOWNLOADS": "1"}), patch.object(
                 app, "claim_download_job", side_effect=flaky_claim
-            ), patch.object(app, "run_download", side_effect=fake_run_download), patch.object(
+            ), patch.object(app, "run_pipeline", side_effect=fake_run_pipeline), patch.object(
                 app, "runtime_unavailable_response", return_value=None
             ):
                 app.reset_scheduler()
@@ -116,13 +116,13 @@ class ApiClaimErrorTests(unittest.TestCase):
                 raise RuntimeError("boom")
             return real_claim(job_id)
 
-        def fake_run_download(job_id, url, format_choice, format_id):
+        def fake_run_pipeline(job_id, url, title):
             executed.append(job_id)
             done.set()
 
         with patch.dict(os.environ, {"LINKSIFT_MAX_CONCURRENT_DOWNLOADS": "1"}), patch.object(
             app, "claim_download_job", side_effect=flaky_claim
-        ), patch.object(app, "run_download", side_effect=fake_run_download), patch.object(
+        ), patch.object(app, "run_pipeline", side_effect=fake_run_pipeline), patch.object(
             app, "runtime_unavailable_response", return_value=None
         ):
             app.reset_scheduler()

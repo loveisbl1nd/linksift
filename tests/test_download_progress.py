@@ -83,37 +83,42 @@ class DownloadProgressTests(unittest.TestCase):
             app.jobs.pop(job_id, None)
 
     def test_streaming_command_updates_progress_and_honors_timeout(self):
+        job_id = "streaming-test"
         job = {"status": "downloading"}
-        line = app.PROGRESS_PREFIX + json.dumps({
-            "status": "downloading",
-            "downloaded_bytes": 1024,
-            "total_bytes": 4096,
-            "speed": 512,
-            "eta": 6,
-        }) + "\n"
+        app.jobs[job_id] = job
+        try:
+            line = app.PROGRESS_PREFIX + json.dumps({
+                "status": "downloading",
+                "downloaded_bytes": 1024,
+                "total_bytes": 4096,
+                "speed": 512,
+                "eta": 6,
+            }) + "\n"
 
-        class FakeProcess:
-            def __init__(self):
-                self.stdout = iter([line, "warning line\n"])
-                self.returncode = 0
-                self.wait_timeout = None
+            class FakeProcess:
+                def __init__(self):
+                    self.stdout = iter([line, "warning line\n"])
+                    self.returncode = 0
+                    self.wait_timeout = None
 
-            def wait(self, timeout):
-                self.wait_timeout = timeout
-                return self.returncode
+                def wait(self, timeout):
+                    self.wait_timeout = timeout
+                    return self.returncode
 
-            def kill(self):
-                self.returncode = -9
+                def kill(self):
+                    self.returncode = -9
 
-        process = FakeProcess()
-        with patch.object(app.subprocess, "Popen", return_value=process) as popen:
-            result = app.run_download_command(["yt-dlp", "url"], job, 3600)
+            process = FakeProcess()
+            with patch.object(app.subprocess, "Popen", return_value=process) as popen:
+                result = app.run_download_command(["yt-dlp", "url"], job_id, job, 3600)
 
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("warning line", result.stderr)
-        self.assertEqual(job["percent"], 25.0)
-        self.assertEqual(process.wait_timeout, 3600)
-        self.assertEqual(popen.call_args.kwargs["stderr"], app.subprocess.STDOUT)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("warning line", result.stderr)
+            self.assertEqual(job["percent"], 25.0)
+            self.assertEqual(process.wait_timeout, 3600)
+            self.assertEqual(popen.call_args.kwargs["stderr"], app.subprocess.STDOUT)
+        finally:
+            app.jobs.pop(job_id, None)
 
     def test_new_job_starts_queued_with_empty_progress(self):
         class AcceptingScheduler:
@@ -152,7 +157,7 @@ class DownloadProgressTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temp_dir:
                 output = Path(temp_dir) / f"{job_id}.mp4"
 
-                def finish_download(command, job, timeout):
+                def finish_download(command, parent_job_id, progress_target, timeout):
                     output.write_bytes(b"complete-file")
                     return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 

@@ -45,7 +45,9 @@ class PostprocessProgressTests(unittest.TestCase):
                 self.assertEqual(job, {"status": status, "phase": status})
 
     def test_reader_routes_progress_lines_away_from_diagnostics(self):
-        job = {"id": "ppreader01", "status": "downloading"}
+        job_id = "ppreader01"
+        job = {"id": job_id, "status": "downloading"}
+        app.jobs[job_id] = job
         lines = [
             app.PROGRESS_PREFIX + json.dumps({"downloaded_bytes": 10, "total_bytes": 100}) + "\n",
             app.POSTPROCESS_PREFIX + json.dumps({"status": "started"}) + "\n",
@@ -60,13 +62,16 @@ class PostprocessProgressTests(unittest.TestCase):
             def wait(self, timeout):
                 return self.returncode
 
-        with patch.object(app.subprocess, "Popen", return_value=FakeProcess()):
-            result = app.run_download_command(["yt-dlp", "url"], job, 60)
+        try:
+            with patch.object(app.subprocess, "Popen", return_value=FakeProcess()):
+                result = app.run_download_command(["yt-dlp", "url"], job_id, job, 60)
 
-        self.assertEqual(result.stderr, "some warning")
-        self.assertEqual(job["phase"], "processing")
-        self.assertIsNone(job["speed"])
-        self.assertIsNone(job["eta"])
+            self.assertEqual(result.stderr, "some warning")
+            self.assertEqual(job["phase"], "processing")
+            self.assertIsNone(job["speed"])
+            self.assertIsNone(job["eta"])
+        finally:
+            app.jobs.pop(job_id, None)
 
 
 if __name__ == "__main__":

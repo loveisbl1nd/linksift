@@ -40,14 +40,14 @@ Included in `v0.2.0`:
 
 ## v0.3 — Multi-output download pipeline
 
-Planned direction:
+Implemented in the current source tree; not yet released under a versioned tag:
 
-- allow one inspected URL to request multiple explicit output profiles, such as MP4 plus MP3 or multiple video qualities;
-- represent one request as a parent job with independently visible output artifacts;
-- reuse metadata and source media where practical instead of repeating identical extraction or download work;
-- keep queue limits, cancellation, TTL cleanup, and total resource bounds correct for multi-output jobs;
-- separate command construction and lifecycle state into testable modules before expanding the output graph;
-- preserve the current safe interface without exposing arbitrary yt-dlp or shell arguments.
+- [x] one inspected URL can request multiple explicit output profiles, such as MP4 plus MP3 or multiple video qualities;
+- [x] one request is represented as a parent job with independently visible output artifacts (`a000`, `a001`, …), each with its own status, phase, progress, and Save button;
+- [x] source media is reused where practical — an audio artifact extracts MP3 from an already-downloaded MP4 via ffmpeg instead of re-downloading;
+- [x] queue limits, cancellation, TTL cleanup, and total resource bounds remain correct for multi-output jobs: one parent holds one queue entry, one worker slot, and one subprocess registry slot, with artifacts running sequentially under one shared deadline;
+- [x] command construction and lifecycle state are separated into a testable pure-logic module (`output_pipeline.py`) before the output graph expands;
+- [x] the safe interface is preserved without exposing arbitrary yt-dlp or shell arguments (`format_id` is validated against a strict allowlist).
 
 ## Non-goals
 

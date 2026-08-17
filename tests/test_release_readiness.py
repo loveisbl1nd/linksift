@@ -124,6 +124,72 @@ class ReleaseReadinessTests(unittest.TestCase):
             with self.subTest(document=document):
                 self.assertIn(f"]({document})", readme)
 
+    def section(self, text, heading):
+        """Return the body of one markdown section, excluding later headings."""
+        start = text.index(heading) + len(heading)
+        level = len(heading) - len(heading.lstrip("#"))
+        next_heading = re.search(rf"^#{{1,{level}}} ", text[start:], re.MULTILINE)
+        end = start + next_heading.start() if next_heading else len(text)
+        return text[start:end]
+
+    def test_parent_status_docs_keep_starting_a_phase_not_a_status(self):
+        """`starting` is a parent phase; the parent status stays `downloading`.
+
+        app.run_pipeline sets status="downloading" together with phase="starting",
+        so documenting `starting` as a parent status contradicts the API.
+        """
+        readme = self.read("README.md")
+
+        statuses = self.section(readme, "### Parent job statuses")
+        documented = set(re.findall(r"^\| `([a-z_]+)` \|", statuses, re.MULTILINE))
+        self.assertNotIn("starting", documented)
+        self.assertEqual(
+            documented,
+            {"queued", "downloading", "cancelling", "done", "partial", "error", "cancelled", "timed_out"},
+        )
+
+        phases = self.section(readme, "### Parent phases while active")
+        documented_phases = set(re.findall(r"^\| `([a-z]+)` \|", phases, re.MULTILINE))
+        self.assertIn("starting", documented_phases)
+        self.assertTrue(
+            {"downloading", "retrying", "processing"} <= documented_phases,
+            documented_phases,
+        )
+
+    def test_reuse_docs_separate_ordinary_fallback_from_fatal_outcomes(self):
+        """try_ffmpeg_reuse has three outcomes; only the ordinary one falls back."""
+        reuse = self.read("README.md")
+        reuse = self.section(reuse, "### Video-to-audio reuse").lower()
+
+        self.assertIn("three outcomes", reuse)
+        self.assertIn("ordinary failure", reuse)
+        self.assertIn("pipelinecancelled", reuse)
+        self.assertIn("timeoutexpired", reuse)
+        self.assertIn("timed_out", reuse)
+        # The corrected claim: ordinary failures MAY fall back; cancellation and
+        # deadline expiry never do.
+        self.assertNotIn("fails to publish (timeout or cancellation) is fatal", reuse)
+        self.assertIn("not every publication error is fatal", reuse)
+        self.assertRegex(reuse, r"only the ordinary[- ]failure branch falls back")
+
+    def test_node_detection_in_tests_is_cross_platform(self):
+        """Tests must locate node with shutil.which, not the Unix-only `which`."""
+        offenders = []
+        uses_shutil_which = []
+        for path in sorted((ROOT / "tests").glob("test_*.py")):
+            if path.name == Path(__file__).name:  # this file only quotes the patterns
+                continue
+            source = path.read_text(encoding="utf-8")
+            if re.search(r"""\[\s*["'](?:which|where)["']\s*,\s*["']node["']""", source):
+                offenders.append(path.name)
+            if 'shutil.which("node")' in source:
+                uses_shutil_which.append(path.name)
+                with self.subTest(path=path.name):
+                    self.assertRegex(source, r"(?m)^import shutil$", msg="shutil must be imported")
+
+        self.assertEqual(offenders, [], f"Unix-only node detection in: {offenders}")
+        self.assertIn("test_phase_propagation.py", uses_shutil_which)
+
 
 if __name__ == "__main__":
     unittest.main()

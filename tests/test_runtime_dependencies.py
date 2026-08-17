@@ -153,3 +153,29 @@ class RuntimeDependencyTests(unittest.TestCase):
         self.assertNotIn("build:", release_compose)
         self.assertIn('"127.0.0.1:8899:8899"', release_compose)
         self.assertIn("linksift-downloads", release_compose)
+
+    def test_multi_output_compose_example_targets_the_real_service(self):
+        """The v0.3 override example must configure the existing service.
+
+        Compose service keys are case-sensitive: a `linkSift:` key would define a
+        second service instead of overriding `linksift:`.
+        """
+        root = Path(app.__file__).parent
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+
+        override_block = re.search(
+            r"```yaml\s*\n(# docker-compose\.yml override.*?)\n```", readme, re.DOTALL
+        )
+        self.assertIsNotNone(override_block, "expected a yaml compose override example")
+        example = override_block.group(1)
+
+        real_services = set(re.findall(r"^  ([A-Za-z0-9_.-]+):", compose, re.MULTILINE))
+        example_services = set(re.findall(r"^  ([A-Za-z0-9_.-]+):", example, re.MULTILINE))
+        self.assertTrue(example_services)
+        self.assertTrue(
+            example_services <= real_services,
+            f"example services {sorted(example_services)} are not all real services {sorted(real_services)}",
+        )
+        self.assertIn("linksift", example_services)
+        self.assertNotIn("linkSift", example)

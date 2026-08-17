@@ -227,7 +227,7 @@ class SchedulerApiIntegrationTests(unittest.TestCase):
         release = threading.Event()
         first_started = threading.Event()
 
-        def fake_run_download(job_id, url, format_choice, format_id):
+        def fake_run_pipeline(job_id, url, title):
             first_started.set()
             release.wait(timeout=10)
 
@@ -235,7 +235,7 @@ class SchedulerApiIntegrationTests(unittest.TestCase):
             with patch.dict(os.environ, {
                 "LINKSIFT_MAX_CONCURRENT_DOWNLOADS": "1",
                 "LINKSIFT_MAX_QUEUED_DOWNLOADS": "1",
-            }), patch.object(app, "run_download", side_effect=fake_run_download), patch.object(
+            }), patch.object(app, "run_pipeline", side_effect=fake_run_pipeline), patch.object(
                 app, "runtime_unavailable_response", return_value=None
             ):
                 app.reset_scheduler()
@@ -262,7 +262,7 @@ class SchedulerApiIntegrationTests(unittest.TestCase):
         first_started = threading.Event()
         executed = []
 
-        def fake_run_download(job_id, url, format_choice, format_id):
+        def fake_run_pipeline(job_id, url, title):
             executed.append(job_id)
             with app.jobs_lock:
                 job = app.jobs.get(job_id)
@@ -277,7 +277,7 @@ class SchedulerApiIntegrationTests(unittest.TestCase):
 
         try:
             with patch.dict(os.environ, {"LINKSIFT_MAX_CONCURRENT_DOWNLOADS": "1"}), patch.object(
-                app, "run_download", side_effect=fake_run_download
+                app, "run_pipeline", side_effect=fake_run_pipeline
             ), patch.object(app, "runtime_unavailable_response", return_value=None):
                 app.reset_scheduler()
                 first = self.client.post("/api/download", json={"url": "https://example.test/v1"})

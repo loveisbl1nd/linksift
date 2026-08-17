@@ -9,6 +9,7 @@ __pycache__
 tests
 *.py[cod]
 out_*.txt
+test_baseline.txt
 verify_*.py
 
 # Runtime and local secrets
