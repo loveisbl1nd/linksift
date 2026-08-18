@@ -540,7 +540,11 @@ class PollCardRuntimeTests(unittest.TestCase):
         template = read_template()
         sources = "\n".join(
             function_source(template, name)
-            for name in ["syncCardSaveState", "saveArtifact", "saveCard", "pollCard"]
+            # pollCard resolves the packaging artifact's type through
+            # currentArtifactType, so the harness must supply the real helper.
+            # Omitting it makes pollCard throw inside its own promise, which the
+            # test only sees as an empty result rather than an error.
+            for name in ["currentArtifactType", "syncCardSaveState", "saveArtifact", "saveCard", "pollCard"]
         )
         # pollCard fetches /api/status; the save helpers fetch /api/file. Route
         # status requests to the scripted responder, everything else to the

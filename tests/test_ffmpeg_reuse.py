@@ -12,6 +12,7 @@ an ordinary fallback — i.e. it re-ran yt-dlp for a job the user had stopped.
 These tests drive ``try_ffmpeg_reuse`` with a fake Popen so they never invoke
 ffmpeg, yt-dlp, or the network.
 """
+import io
 import os
 import subprocess
 import tempfile
@@ -26,9 +27,29 @@ import app
 
 JOB = "0123456789"
 
+# What a real ffmpeg writes on the MERGED stream try_ffmpeg_reuse reads: the
+# input dump carrying `Duration:` plus the unindented key=value blocks of
+# `-progress pipe:1`. Kept short so the reader thread reaches EOF at once.
+FFMPEG_TRANSCRIPT = (
+    "ffmpeg version 6.0\n"
+    "  Duration: 00:00:15.00, start: 0.000000, bitrate: 129 kb/s\n"
+    "out_time=00:00:07.50\n"
+    "speed=12.3x\n"
+    "progress=continue\n"
+    "out_time=00:00:15.00\n"
+    "speed=12.5x\n"
+    "progress=end\n"
+)
+
 
 class FakeFFmpegProcess:
-    """Full Popen surface for ffmpeg: pid/poll/communicate/wait/terminate/kill."""
+    """Full Popen surface for ffmpeg: pid/poll/stdout/wait/terminate/kill.
+
+    try_ffmpeg_reuse merges stderr into stdout and drains that single pipe on a
+    reader thread, so the fake must expose an iterable, closeable stdout that
+    reaches EOF. ffmpeg "finishing" is modelled in wait(), which is what the
+    production code blocks on.
+    """
 
     def __init__(self, cmd, fail=False, fast=True, **kwargs):
         self.cmd = cmd
@@ -40,7 +61,8 @@ class FakeFFmpegProcess:
         self.returncode = None
         self.terminate_calls = 0
         self.kill_calls = 0
-        self.communicate_calls = 0
+        self.wait_calls = 0
+        self.stdout = io.StringIO(FFMPEG_TRANSCRIPT)
         # A real ffmpeg writes the temp output file just before finishing.
         self.temp_output = cmd[-1]
         if not self._fail and self._fast:
@@ -52,19 +74,14 @@ class FakeFFmpegProcess:
     def poll(self):
         return None if self._alive else self.returncode
 
-    def communicate(self, timeout=None):
-        self.communicate_calls += 1
-        if self._fast:
-            self._alive = False
-            self.returncode = 1 if self._fail else 0
-            return "", ""
-        # Slow: simulate the timeout expiring with no returncode.
-        raise subprocess.TimeoutExpired(cmd=self.cmd, timeout=timeout)
-
     def wait(self, timeout=None):
+        self.wait_calls += 1
+        if not self._fast:
+            # Slow: simulate the timeout expiring with no returncode.
+            raise subprocess.TimeoutExpired(cmd=self.cmd, timeout=timeout)
         if self._alive:
             self._alive = False
-            self.returncode = self.returncode if self.returncode is not None else 0
+            self.returncode = 1 if self._fail else 0
         return self.returncode
 
     def terminate(self):
@@ -192,7 +209,7 @@ class FatalNoFallbackTests(FFmpegReuseTestBase):
         video = self.make_video()
         artifact = self.make_artifact()
         # Deadline stays positive at the gate so the process actually spawns,
-        # then communicate(timeout=remaining) raises to simulate the budget
+        # then wait(timeout=remaining) raises to simulate the budget
         # expiring while ffmpeg runs.
         deadline = time.monotonic() + 5.0
         app.jobs[JOB] = {
@@ -210,9 +227,14 @@ class FatalNoFallbackTests(FFmpegReuseTestBase):
                 super().__init__(cmd, **kwargs)
                 type(self)._instance_ref = self
 
-            def communicate(self, timeout=None):
-                captured["seen"] = timeout
-                raise subprocess.TimeoutExpired(cmd=self.cmd, timeout=timeout)
+            def wait(self, timeout=None):
+                if self._alive:
+                    # Still running when the budget ran out: exactly what the
+                    # production wait(timeout=remaining) hits on a real hang.
+                    captured["seen"] = timeout
+                    raise subprocess.TimeoutExpired(cmd=self.cmd, timeout=timeout)
+                # Reaped by terminate_and_reap: the wait then succeeds.
+                return super().wait(timeout=timeout)
 
         # subprocess.run is used by terminate_process_tree's Windows taskkill;
         # stub it so the patched Popen is not abused as a taskkill subprocess.
@@ -232,7 +254,7 @@ class FatalNoFallbackTests(FFmpegReuseTestBase):
 
         self._assert_temps_cleaned()
         self.assertNotIn(JOB, app.processes, "registry must be cleared on timeout")
-        self.assertIsNotNone(captured.get("seen"), "communicate(timeout=) must run")
+        self.assertIsNotNone(captured.get("seen"), "wait(timeout=) must run")
         self.assertIsNotNone(inst, "a process must have spawned")
         self.assertTrue(
             inst.kill_calls or inst.terminate_calls,
@@ -250,13 +272,13 @@ class FatalNoFallbackTests(FFmpegReuseTestBase):
         }
 
         class CancelAfterFFmpeg(FakeFFmpegProcess):
-            def communicate(self, timeout=None):
+            def wait(self, timeout=None):
                 # ffmpeg finishes, but the parent was cancelled during the run.
                 self._alive = False
                 self.returncode = 0
                 Path(self.temp_output).write_bytes(b"mp3")
                 app.jobs[JOB]["cancel_requested"] = True
-                return "", ""
+                return self.returncode
 
         with patch.object(subprocess, "Popen", CancelAfterFFmpeg):
             with self.assertRaises(app.PipelineCancelled):
@@ -306,13 +328,13 @@ class FatalNoFallbackTests(FFmpegReuseTestBase):
         final = os.path.join(self.tmp.name, f"{JOB}.a001.mp3")
 
         class CancelBeforePublish(FakeFFmpegProcess):
-            def communicate(self, timeout=None):
+            def wait(self, timeout=None):
                 self._alive = False
                 self.returncode = 0
                 # Cancel arrives after ffmpeg finished but before the function
                 # gets a chance to publish.
                 app.jobs[JOB]["cancel_requested"] = True
-                return "", ""
+                return self.returncode
 
         with patch.object(subprocess, "Popen", CancelBeforePublish):
             with self.assertRaises(app.PipelineCancelled):

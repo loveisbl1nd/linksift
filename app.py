@@ -1,5 +1,6 @@
 import contextlib
 import glob
+import hashlib
 import importlib.metadata
 import importlib.util
 import json
@@ -76,6 +77,12 @@ is_intermediate_file = pipeline.is_intermediate_file
 
 jobs = {}
 processes = {}
+# client_request_id -> {"job_id", "fingerprint"}. Guarded by jobs_lock, and
+# entered in the SAME critical section that registers the job, so two concurrent
+# retries of one user action can never both reach the scheduler. Entries are
+# removed by run_cleanup together with the job they point at, so this map can
+# never outlive the jobs dict.
+request_ids = {}
 jobs_lock = threading.Lock()
 cleanup_lock = threading.Lock()
 last_cleanup_monotonic = None
@@ -265,6 +272,76 @@ def get_url(data):
     return url.strip()
 
 
+# A UUID with room to spare for other client-side id schemes, restricted to
+# characters that are safe to place in a log line unescaped.
+CLIENT_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+
+# Free-form values are rejected rather than logged: the launch source is a
+# closed set the frontend owns, and an unknown value means a client bug or a
+# forged request, not a new launch mode.
+LAUNCH_SOURCES = frozenset({"single-card", "download-all"})
+
+
+def get_client_request_id(data):
+    """Validate the optional ``client_request_id``.
+
+    Returns ``(value_or_None, error_message_or_None)``. A request that omits the
+    field is valid and gets no idempotency protection, which is exactly how
+    clients predating this field keep working.
+    """
+    if "client_request_id" not in data:
+        return None, None
+    value = data.get("client_request_id")
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        return None, "client_request_id must be a string"
+    value = value.strip()
+    if not CLIENT_REQUEST_ID_PATTERN.match(value):
+        return None, (
+            "client_request_id must be 8-128 characters of letters, digits, '-' or '_'"
+        )
+    return value, None
+
+
+def get_launch_source(data):
+    """Validate the optional ``launch_source``; returns (value, error)."""
+    if "launch_source" not in data:
+        return None, None
+    value = data.get("launch_source")
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        return None, "launch_source must be a string"
+    value = value.strip()
+    if value not in LAUNCH_SOURCES:
+        return None, "launch_source is not a recognized value"
+    return value, None
+
+
+def download_request_fingerprint(url, title, outputs):
+    """Stable digest of what a download request actually asks for.
+
+    Two requests carrying the same ``client_request_id`` are the same launch
+    only if they ask for the same thing; a reused id with a different payload is
+    a client bug worth reporting rather than silently answering with the wrong
+    job. Hashed rather than stored raw so the URL and title never sit in a
+    second in-memory structure.
+    """
+    canonical = json.dumps(
+        {
+            "url": url,
+            "title": title,
+            "outputs": [
+                {"type": o.get("type"), "format_id": o.get("format_id")} for o in outputs
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def parse_ytdlp_json(stdout):
     """Return the first valid JSON object emitted by yt-dlp."""
     for line in stdout.splitlines():
@@ -347,6 +424,87 @@ def update_job_postprocess(job, line):
     return True
 
 
+def read_ffmpeg_progress(job_id, artifact, stream, diagnostics):
+    """Consume ffmpeg's merged output, publishing packaging progress live.
+
+    Runs on a daemon thread while ffmpeg works, so the artifact's percent moves
+    during the packaging step instead of jumping from nothing to 100 when the
+    process finally exits.
+
+    The stream is drained all the way to EOF even after the job goes terminal:
+    an unread pipe blocks ffmpeg's next write, and a blocked ffmpeg cannot be
+    reaped. Once terminal, lines are consumed and discarded rather than applied,
+    which is the same sticky-terminal rule ``update_job_progress`` follows.
+
+    Duration comes from ffmpeg's own input dump (``Duration: HH:MM:SS.ss``) on
+    the merged stream, so no ffprobe is spawned and there is no second process
+    to gate, register, reap or race against.
+    """
+    state = {"duration": None, "processed": None, "speed": None, "percent": None}
+
+    def publish():
+        percent = pipeline.compute_processing_percent(
+            state["processed"], state["duration"], state["percent"]
+        )
+        # Remembered so a later block can never publish a lower number.
+        state["percent"] = percent
+        eta = pipeline.compute_processing_eta(
+            state["processed"], state["duration"], state["speed"]
+        )
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if job is None or job.get("status") in TERMINAL_STATUSES:
+                return
+            if artifact.get("status") in pipeline.ARTIFACT_TERMINAL:
+                return
+            artifact.update({
+                "status": "processing",
+                "phase": "processing",
+                "duration_seconds": state["duration"],
+                "processed_seconds": state["processed"],
+                "percent": percent,
+                "eta": eta,
+                "processing_speed": state["speed"],
+            })
+
+    try:
+        for raw_line in stream:
+            line = raw_line.rstrip("\r\n")
+            if state["duration"] is None:
+                duration = pipeline.parse_ffmpeg_duration(line)
+                if duration is not None:
+                    state["duration"] = duration
+                    # Published immediately so the UI can leave the
+                    # indeterminate state as soon as the length is known.
+                    publish()
+                    continue
+            parsed = pipeline.parse_ffmpeg_progress_line(line)
+            if parsed is None:
+                text = line.strip()
+                if text:
+                    diagnostics.append(text)
+                continue
+            key, value = parsed
+            if key in pipeline.FFMPEG_TIME_KEYS:
+                seconds = pipeline.ffmpeg_progress_seconds(key, value)
+                if seconds is not None and (
+                    state["processed"] is None or seconds >= state["processed"]
+                ):
+                    state["processed"] = seconds
+            elif key == "speed":
+                speed = pipeline.parse_ffmpeg_speed(value)
+                if speed is not None:
+                    state["speed"] = speed
+            elif key == "progress":
+                # ffmpeg terminates every progress block with this key, so one
+                # publish per block keeps the lock traffic bounded.
+                publish()
+    except (OSError, ValueError):
+        # A pipe torn down by terminate_and_reap is an expected end, not a
+        # failure: the waiting thread owns the outcome, this thread just stops.
+        pass
+
+
 def terminate_process_tree(process):
     """Best-effort termination of a subprocess and its children (ffmpeg)."""
     if process is None or process.poll() is not None:
@@ -414,6 +572,76 @@ def is_transient_download_error(stderr_text):
     if any(marker in text for marker in PERMANENT_DOWNLOAD_ERROR_MARKERS):
         return False
     return any(marker in text for marker in TRANSIENT_DOWNLOAD_ERROR_MARKERS)
+
+
+# YouTube's default player client hands out media URLs that its CDN then rejects
+# with 403 for the whole stream, while the embedded client's URLs download fine.
+# Only used as a *fallback*: some videos disable embedding, so forcing it on the
+# first attempt would break downloads that currently work.
+YOUTUBE_FALLBACK_CLIENT = "web_embedded"
+
+_YOUTUBE_HOSTS = frozenset({"youtube.com", "youtu.be"})
+
+
+def is_youtube_url(url):
+    """True only when the URL's *hostname* is YouTube.
+
+    The hostname is parsed with urllib.parse rather than substring-matched, so
+    ``https://youtube.com.evil.example/x`` and ``https://notyoutube.com/x`` are
+    correctly rejected: an attacker-controlled host must never be able to steer
+    our extractor arguments. Subdomains (``www.``, ``m.``, ``music.``) are
+    accepted, malformed input returns False instead of raising.
+    """
+    try:
+        hostname = urlparse(url or "").hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    hostname = hostname.lower().rstrip(".")
+    for base in _YOUTUBE_HOSTS:
+        if hostname == base or hostname.endswith("." + base):
+            return True
+    return False
+
+
+def is_http_403_error(stderr_text):
+    """True when yt-dlp's output genuinely reports an HTTP 403.
+
+    Deliberately narrower than is_transient_download_error: only a real 403
+    justifies switching the player client. 429/503/connection resets are still
+    handled by the ordinary same-client retry.
+    """
+    text = (stderr_text or "").lower()
+    if not text:
+        return False
+    return "http error 403" in text or "403: forbidden" in text
+
+
+def should_retry_with_youtube_fallback(url, stderr_text, job_id, deadline, already_used):
+    """Decide whether the *next* attempt should force the embedded client.
+
+    Every guard the ordinary retry path honours is re-checked here, because this
+    decision is made after a subprocess returned and the world may have moved
+    on: the job may have been cancelled, reached a terminal status, or run out
+    of shared deadline while yt-dlp was running. Returning False leaves the
+    existing retry semantics completely untouched.
+    """
+    if already_used:
+        return False
+    if not is_youtube_url(url):
+        return False
+    if not is_http_403_error(stderr_text):
+        return False
+    if cancel_requested(job_id):
+        return False
+    if time.monotonic() >= deadline:
+        return False
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job is None or job.get("status") in TERMINAL_STATUSES:
+            return False
+    return True
 
 
 def wait_before_retry(job, delay, deadline):
@@ -675,6 +903,20 @@ def remove_quietly(path):
     try:
         os.remove(path)
     except OSError:
+        pass
+
+
+def close_quietly(stream):
+    """Best-effort close of a subprocess pipe.
+
+    ``Popen.wait()`` does not close the pipes ``communicate()`` would have, so
+    without this every packaged artifact leaks one file descriptor.
+    """
+    if stream is None:
+        return
+    try:
+        stream.close()
+    except (OSError, ValueError):
         pass
 
 
@@ -985,11 +1227,22 @@ def execute_single_artifact(job_id, url, artifact, deadline, title):
     max_attempts = artifact.get("max_attempts", get_job_retries() + 1)
     base_delay = get_retry_base_delay()
 
-    cmd = pipeline.build_ytdlp_command(
-        url, job_id, artifact, DOWNLOAD_DIR,
-        PROGRESS_PREFIX, POSTPROCESS_PREFIX,
-        get_concurrent_fragments(), ytdlp_runtime_args()
-    )
+    # None = yt-dlp's default client. Only ever set by the 403 fallback below,
+    # and only once, so the retry budget is unchanged.
+    youtube_client = None
+    youtube_fallback_used = False
+
+    def build_command():
+        # Rebuilt from scratch each attempt so yt-dlp performs a fresh
+        # extraction and no previously spawned argv list is ever mutated.
+        return pipeline.build_ytdlp_command(
+            url, job_id, artifact, DOWNLOAD_DIR,
+            PROGRESS_PREFIX, POSTPROCESS_PREFIX,
+            get_concurrent_fragments(), ytdlp_runtime_args(),
+            youtube_client=youtube_client,
+        )
+
+    cmd = build_command()
 
     for attempt in range(1, max_attempts + 1):
         if cancel_requested(job_id):
@@ -1035,6 +1288,10 @@ def execute_single_artifact(job_id, url, artifact, deadline, title):
         errors = result.stderr.strip().splitlines()
         message = errors[-1] if errors else "Download failed"
 
+        use_youtube_fallback = should_retry_with_youtube_fallback(
+            url, result.stderr, job_id, deadline, youtube_fallback_used
+        )
+
         if attempt >= max_attempts or not is_transient_download_error(result.stderr):
             cleanup_artifact_files(job_id, artifact["id"])
             artifact.update({
@@ -1060,6 +1317,19 @@ def execute_single_artifact(job_id, url, artifact, deadline, title):
             "Transient failure for job %s artifact %s; retrying (attempt %d/%d): %s",
             job_id, artifact["id"], attempt + 1, max_attempts, message
         )
+
+        if use_youtube_fallback:
+            youtube_client = YOUTUBE_FALLBACK_CLIENT
+            youtube_fallback_used = True
+            # Job id only: never the URL, query string or provider token.
+            app.logger.warning(
+                "Retrying YouTube download with embedded client after HTTP 403 "
+                "(job %s artifact %s)",
+                job_id, artifact["id"]
+            )
+
+        # Fresh argv for the next attempt; picks up the fallback client when set.
+        cmd = build_command()
 
         if not wait_before_retry(job, delay, deadline):
             if cancel_requested(job_id):
@@ -1103,6 +1373,15 @@ def try_ffmpeg_reuse(job_id, artifact, completed_videos, deadline, title):
         artifact.update({
             "status": "processing",
             "phase": "processing",
+            # Cleared, not carried over: whatever the download step left behind
+            # describes bytes, not packaging, and would otherwise be shown as
+            # the packaging speed/ETA until the first ffmpeg block arrives.
+            "speed": None,
+            "eta": None,
+            "percent": None,
+            "processed_seconds": None,
+            "duration_seconds": None,
+            "processing_speed": None,
         })
 
     popen_kwargs = {}
@@ -1116,7 +1395,13 @@ def try_ffmpeg_reuse(job_id, artifact, completed_videos, deadline, title):
         progress_target=artifact,
         deadline=deadline,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        # Merged so ONE reader drains both pipes. ffmpeg writes -progress
+        # blocks to stdout and its input dump (the Duration line) to stderr;
+        # two pipes with one reader deadlocks as soon as the unread one fills.
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        bufsize=1,
         **popen_kwargs,
     )
     if process is None:
@@ -1127,13 +1412,23 @@ def try_ffmpeg_reuse(job_id, artifact, completed_videos, deadline, title):
             raise subprocess.TimeoutExpired(cmd, get_download_timeout())
         raise PipelineCancelled(f"job {job_id} stopped before ffmpeg reuse")
 
+    diagnostics = deque(maxlen=200)
+    reader = threading.Thread(
+        target=read_ffmpeg_progress,
+        args=(job_id, artifact, process.stdout, diagnostics),
+        daemon=True,
+    )
+    reader.start()
+
     try:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise subprocess.TimeoutExpired(cmd, get_download_timeout())
-        process.communicate(timeout=remaining)
+        # wait(), not communicate(): the reader owns the pipe, so the output is
+        # consumed as it is produced rather than buffered until exit.
+        process.wait(timeout=remaining)
     except BaseException:
-        # Covers TimeoutExpired AND anything unexpected out of communicate()
+        # Covers TimeoutExpired AND anything unexpected out of wait()
         # (OSError, ValueError, KeyboardInterrupt...). Whatever went wrong, the
         # ffmpeg process may still be alive: reap it before unwinding, or the
         # next artifact starts while a stale ffmpeg still holds its output file.
@@ -1144,6 +1439,10 @@ def try_ffmpeg_reuse(job_id, artifact, completed_videos, deadline, title):
         remove_quietly(temp_output)
         raise
     finally:
+        # Reaping the tree closes the pipe, so the reader reaches EOF and this
+        # join cannot hold the pipeline behind a process that is already gone.
+        reader.join(timeout=5)
+        close_quietly(process.stdout)
         # Identity-checked: a slow unwind here must never evict the entry that
         # the NEXT artifact has already registered under the same parent id.
         unregister_process_if_current(job_id, process)
@@ -1201,6 +1500,12 @@ def try_ffmpeg_reuse(job_id, artifact, completed_videos, deadline, title):
         "speed": None,
         "eta": None,
         "percent": 100.0,
+        # Live-only fields. ffmpeg's last block routinely stops a few frames
+        # short of the duration, so leaving them set would make a finished
+        # artifact read "1:22 / 1:23 processed" forever. duration_seconds is
+        # kept: it describes the media, not the run.
+        "processed_seconds": None,
+        "processing_speed": None,
     })
     return True
 
@@ -1343,42 +1648,28 @@ def run_download(job_id, url, format_choice, format_id):
         finish_job_cancelled(job_id)
         return
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--newline",
-        "--progress",
-        "--progress-template",
-        f"download:{PROGRESS_PREFIX}%(progress)j",
-        "--progress-template",
-        f"postprocess:{POSTPROCESS_PREFIX}%(progress)j",
-        "--concurrent-fragments",
-        str(get_concurrent_fragments()),
-        "--continue",
-        "--part",
-        "--retries",
-        "10",
-        "--fragment-retries",
-        "10",
-        "--extractor-retries",
-        "3",
-        "--retry-sleep",
-        "http:exp=1:20",
-        "--retry-sleep",
-        "fragment:exp=1:20",
-        *ytdlp_runtime_args(),
-        "-o",
-        out_template,
-    ]
 
-    if format_choice == "audio":
-        cmd += ["-x", "--audio-format", "mp3"]
-    elif format_id:
-        cmd += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
-    else:
-        cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
+    # Shares one builder with the multi-output pipeline so the 403 fallback
+    # cannot drift between the two paths. The legacy filename contract is kept
+    # by passing this path's own output template.
+    legacy_artifact = {
+        "id": job_id,
+        "type": "audio" if format_choice == "audio" else "video",
+        "format_id": None if format_choice == "audio" else format_id,
+    }
+    youtube_client = None
+    youtube_fallback_used = False
 
-    cmd += ["--", url]
+    def build_command():
+        return pipeline.build_ytdlp_command(
+            url, job_id, legacy_artifact, DOWNLOAD_DIR,
+            PROGRESS_PREFIX, POSTPROCESS_PREFIX,
+            get_concurrent_fragments(), ytdlp_runtime_args(),
+            youtube_client=youtube_client,
+            output_template=out_template,
+        )
+
+    cmd = build_command()
     timeout = get_download_timeout()
     base_delay = get_retry_base_delay()
     deadline = time.monotonic() + timeout
@@ -1398,6 +1689,9 @@ def run_download(job_id, url, format_choice, format_id):
                 break
             errors = result.stderr.strip().splitlines()
             message = errors[-1] if errors else "Download failed"
+            use_youtube_fallback = should_retry_with_youtube_fallback(
+                url, result.stderr, job_id, deadline, youtube_fallback_used
+            )
             if attempt >= max_attempts or not is_transient_download_error(result.stderr):
                 cleanup_job_files(job_id)
                 set_error(job_id, message)
@@ -1422,6 +1716,16 @@ def run_download(job_id, url, format_choice, format_id):
                 max_attempts,
                 message,
             )
+            if use_youtube_fallback:
+                youtube_client = YOUTUBE_FALLBACK_CLIENT
+                youtube_fallback_used = True
+                # Job id only: never the URL, query string or provider token.
+                app.logger.warning(
+                    "Retrying YouTube download with embedded client after HTTP 403 (job %s)",
+                    job_id,
+                )
+            # Fresh argv for the next attempt; picks up the fallback client when set.
+            cmd = build_command()
             # Intermediate .part files are intentionally kept so the next
             # attempt can resume; the total deadline keeps ticking.
             if not wait_before_retry(job, delay, deadline):
@@ -1542,6 +1846,13 @@ def run_cleanup(now=None):
             expired.append(job_id)
             jobs.pop(job_id, None)
             processes.pop(job_id, None)
+            # Idempotency data dies with the job it protects. Identity-checked
+            # so a request id already reassigned to a newer job survives.
+            request_id = job.get("client_request_id")
+            if request_id is not None:
+                entry = request_ids.get(request_id)
+                if entry is not None and entry.get("job_id") == job_id:
+                    request_ids.pop(request_id, None)
     active_scheduler = scheduler
     if active_scheduler is not None:
         for job_id in expired:
@@ -1711,6 +2022,14 @@ def start_download():
     if not isinstance(title, str):
         return jsonify({"error": "Title must be a string"}), 400
 
+    client_request_id, id_error = get_client_request_id(data)
+    if id_error:
+        return jsonify({"error": id_error}), 400
+
+    launch_source, source_error = get_launch_source(data)
+    if source_error:
+        return jsonify({"error": source_error}), 400
+
     unavailable = runtime_unavailable_response(("yt-dlp", "ffmpeg"))
     if unavailable:
         return unavailable
@@ -1719,6 +2038,12 @@ def start_download():
     outputs, error_msg = pipeline.normalize_outputs(data)
     if error_msg:
         return jsonify({"error": error_msg}), 400
+
+    fingerprint = (
+        download_request_fingerprint(url, title, outputs)
+        if client_request_id is not None
+        else None
+    )
 
     # Acquire the scheduler before creating the job and outside jobs_lock:
     # a worker-startup failure then leaves nothing behind to roll back.
@@ -1746,37 +2071,92 @@ def start_download():
         art["attempt"] = 0
         art["max_attempts"] = get_job_retries() + 1
 
+    accepted = False
+    duplicate_hit = None
+    duplicate_conflict = None
+
     with jobs_lock:
-        jobs[job_id] = {
-            "id": job_id,
-            "status": "queued",
-            "phase": "queued",
-            "url": url,
-            "title": title,
-            "artifacts": display_order,
-            "execution_order": execution_order,
-            "current_artifact_id": None,
-            "downloaded_bytes": 0,
-            "total_bytes": None,
-            "speed": None,
-            "eta": None,
-            "percent": None,
-            "cancel_requested": False,
-            "cancel_event": threading.Event(),
-            "created_at": time.time(),
-            "started_at": None,
-            "finished_at": None,
-        }
-        # The job must exist before a worker can pick it up; if the queue is
-        # full it is removed in the same critical section, leaving no orphan.
-        accepted = download_scheduler.submit(
-            job_id,
-            lambda: run_pipeline(job_id, url, title),
+        # The duplicate check, the job insert and the scheduler submit all live
+        # in ONE critical section. Two concurrent retries of the same launch
+        # therefore serialize: the first registers the id and submits, the
+        # second sees the entry and returns the first one's job_id without ever
+        # reaching the scheduler.
+        if client_request_id is not None:
+            existing = request_ids.get(client_request_id)
+            if existing is not None:
+                if existing["fingerprint"] != fingerprint:
+                    duplicate_conflict = existing
+                else:
+                    duplicate_hit = existing["job_id"]
+
+        if duplicate_hit is None and duplicate_conflict is None:
+            jobs[job_id] = {
+                "id": job_id,
+                "status": "queued",
+                "phase": "queued",
+                "url": url,
+                "title": title,
+                "artifacts": display_order,
+                "execution_order": execution_order,
+                "current_artifact_id": None,
+                "downloaded_bytes": 0,
+                "total_bytes": None,
+                "speed": None,
+                "eta": None,
+                "percent": None,
+                "cancel_requested": False,
+                "cancel_event": threading.Event(),
+                "created_at": time.time(),
+                "started_at": None,
+                "finished_at": None,
+                # Kept on the job so run_cleanup can drop the matching
+                # request_ids entry when the job expires, leaving no map that
+                # grows for the lifetime of the process.
+                "client_request_id": client_request_id,
+            }
+            if client_request_id is not None:
+                request_ids[client_request_id] = {
+                    "job_id": job_id,
+                    "fingerprint": fingerprint,
+                }
+            # The job must exist before a worker can pick it up; if the queue is
+            # full it is removed in the same critical section, leaving no orphan.
+            accepted = download_scheduler.submit(
+                job_id,
+                lambda: run_pipeline(job_id, url, title),
+            )
+            if not accepted:
+                jobs.pop(job_id, None)
+                if client_request_id is not None:
+                    request_ids.pop(client_request_id, None)
+
+    if duplicate_conflict is not None:
+        # Same id, different ask: answering with the other job's id would hand
+        # the client progress for a download it did not request.
+        app.logger.warning(
+            "Rejected reused client_request_id with a different payload "
+            "(existing job %s, launch_source %s)",
+            duplicate_conflict["job_id"], launch_source or "unspecified",
         )
-        if not accepted:
-            jobs.pop(job_id, None)
+        return jsonify({
+            "error": "client_request_id was already used for a different download",
+        }), 409
+
+    if duplicate_hit is not None:
+        # Ids and states only: never the URL, title, or request body.
+        app.logger.info(
+            "Download launch deduplicated (job %s, launch_source %s, deduplicated true)",
+            duplicate_hit, launch_source or "unspecified",
+        )
+        return jsonify({"job_id": duplicate_hit, "deduplicated": True})
+
     if not accepted:
         return jsonify({"error": "Download queue is full"}), 429
+
+    app.logger.info(
+        "Download launch accepted (job %s, launch_source %s, deduplicated false)",
+        job_id, launch_source or "unspecified",
+    )
     return jsonify({"job_id": job_id})
 
 
@@ -1868,6 +2248,13 @@ def check_status(job_id):
                     "error": art.get("error"),
                     "attempt": art.get("attempt"),
                     "max_attempts": art.get("max_attempts"),
+                    # Additive packaging fields. Always present (null when the
+                    # artifact never reached ffmpeg), so an old client that
+                    # ignores them is unaffected and a new one never has to
+                    # distinguish "absent" from "unknown".
+                    "processed_seconds": art.get("processed_seconds"),
+                    "duration_seconds": art.get("duration_seconds"),
+                    "processing_speed": art.get("processing_speed"),
                 })
                 if art["id"] == current_artifact_id:
                     current_artifact = art
@@ -1886,6 +2273,9 @@ def check_status(job_id):
         parent_attempt = job.get("attempt")
         parent_max_attempts = job.get("max_attempts")
         parent_filename = job.get("filename")
+        parent_processed_seconds = None
+        parent_duration_seconds = None
+        parent_processing_speed = None
 
         # Aggregate progress only applies to real multi-output jobs (artifacts
         # exist and at least one has started). A legacy single-output parent, a
@@ -1908,9 +2298,15 @@ def check_status(job_id):
                 parent_bytes = current_artifact.get("downloaded_bytes")
                 parent_total = current_artifact.get("total_bytes")
                 parent_speed = current_artifact.get("speed")
+                # The current artifact's ETA is the parent's ETA in every
+                # phase, packaging included: while ffmpeg runs, that estimate
+                # is the only remaining-time figure the job has.
                 parent_eta = current_artifact.get("eta")
                 parent_attempt = current_artifact.get("attempt")
                 parent_max_attempts = current_artifact.get("max_attempts")
+                parent_processed_seconds = current_artifact.get("processed_seconds")
+                parent_duration_seconds = current_artifact.get("duration_seconds")
+                parent_processing_speed = current_artifact.get("processing_speed")
                 if parent_status not in TERMINAL_STATUSES:
                     parent_filename = None
 
@@ -1928,6 +2324,11 @@ def check_status(job_id):
             "started_at": job.get("started_at"),
             "attempt": parent_attempt,
             "max_attempts": parent_max_attempts,
+            # Mirrors of the current artifact's packaging progress; null for
+            # every job that is not packaging right now.
+            "processed_seconds": parent_processed_seconds,
+            "duration_seconds": parent_duration_seconds,
+            "processing_speed": parent_processing_speed,
         }
 
         # A terminal single-output parent surfaces its one artifact's filename

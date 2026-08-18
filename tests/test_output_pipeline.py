@@ -281,6 +281,79 @@ class AggregateProgressTests(unittest.TestCase):
         # (1 + 0.3) / 3 * 100 = 43.3
         self.assertAlmostEqual(pct, 43.3, places=1)
 
+    def test_finished_current_artifact_is_not_counted_twice(self):
+        """A done current artifact must not inflate the total past 100.
+
+        run_pipeline never clears current_artifact_id, so once the last artifact
+        publishes it is simultaneously in the completed tally and contributing
+        its own 100%. Before this was fixed a two-output job reported 150% the
+        instant it finished - the frontend only hid it by clamping the bar.
+        """
+        for count, expected_bug in ((2, 150.0), (3, 133.3), (4, 125.0)):
+            with self.subTest(outputs=count):
+                artifacts = [
+                    {"id": f"a{i}", "status": "done", "percent": 100}
+                    for i in range(count)
+                ]
+                pct = op.compute_aggregate_progress(artifacts, f"a{count - 1}")
+                self.assertEqual(pct, 100.0)
+                self.assertNotAlmostEqual(pct, expected_bug, places=1)
+
+    def test_double_count_does_not_claim_100_while_work_remains(self):
+        """The double count is worst mid-job: it reports 100% with work left.
+
+        Between artifacts, current_artifact_id still points at the one that just
+        finished. Counting it twice added a whole artifact's worth of progress,
+        so a three-output job read 100% complete while its third output had not
+        started - and unlike the end-of-job case, the 0-100 clamp cannot mask it.
+        """
+        three = [
+            {"id": "a0", "status": "done", "percent": 100},
+            {"id": "a1", "status": "done", "percent": 100},
+            {"id": "a2", "status": "pending", "percent": None},
+        ]
+        pct = op.compute_aggregate_progress(three, "a1")
+        self.assertAlmostEqual(pct, 66.7, places=1)
+        self.assertLess(pct, 100.0,
+                        "a job with an untouched artifact must never read as complete")
+
+        four = three[:2] + [
+            {"id": "a2", "status": "downloading", "percent": 0},
+            {"id": "a3", "status": "pending", "percent": None},
+        ]
+        self.assertEqual(op.compute_aggregate_progress(four, "a1"), 50.0)
+
+    def test_aggregate_never_exceeds_100_on_a_bad_artifact_percent(self):
+        """One out-of-range artifact reading cannot push the total out of range."""
+        for bad in (250, float("inf"), float("nan"), -10, True):
+            with self.subTest(percent=bad):
+                artifacts = [
+                    {"id": "a0", "status": "done", "percent": 100},
+                    {"id": "a1", "status": "processing", "percent": bad},
+                ]
+                pct = op.compute_aggregate_progress(artifacts, "a1")
+                self.assertIsNotNone(pct)
+                self.assertGreaterEqual(pct, 0.0)
+                self.assertLessEqual(pct, 100.0)
+
+    def test_packaging_audio_lifts_the_parent_above_fifty(self):
+        """Real ffmpeg progress must carry a two-output parent from 50% to 100%.
+
+        With no packaging progress the audio artifact had percent None for the
+        whole extraction, pinning the parent at exactly 50%.
+        """
+        artifacts = [
+            {"id": "a0", "status": "done", "percent": 100},
+            {"id": "a1", "status": "processing", "percent": None},
+        ]
+        self.assertEqual(op.compute_aggregate_progress(artifacts, "a1"), 50.0)
+        seen = []
+        for percent in (0, 20, 40, 75, 100):
+            artifacts[1]["percent"] = percent
+            seen.append(op.compute_aggregate_progress(artifacts, "a1"))
+        self.assertEqual(seen, [50.0, 60.0, 70.0, 87.5, 100.0])
+        self.assertEqual(seen, sorted(seen), "the parent bar must never move backwards")
+
 
 class VideoForReuseTests(unittest.TestCase):
     def test_selects_first_completed_video(self):

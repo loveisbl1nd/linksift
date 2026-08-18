@@ -10,6 +10,7 @@ Covers:
 - Artifact file endpoint and legacy compatibility
 - Full parent cleanup
 """
+import io
 import os
 import subprocess
 import tempfile
@@ -20,6 +21,28 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import app
+
+
+# What a real ffmpeg writes on the MERGED stream try_ffmpeg_reuse reads: the
+# input dump carrying `Duration:` plus the unindented key=value blocks of
+# `-progress pipe:1`. Kept short so the reader thread reaches EOF at once.
+FFMPEG_TRANSCRIPT = (
+    "ffmpeg version 6.0\n"
+    "  Duration: 00:00:15.00, start: 0.000000, bitrate: 129 kb/s\n"
+    "out_time=00:00:07.50\n"
+    "speed=12.3x\n"
+    "progress=continue\n"
+    "out_time=00:00:15.00\n"
+    "speed=12.5x\n"
+    "progress=end\n"
+)
+
+# A failing run emits its diagnostics on the same merged stream and never
+# reaches a progress block.
+FFMPEG_FAILURE_TRANSCRIPT = (
+    "ffmpeg version 6.0\n"
+    "ffmpeg error\n"
+)
 
 
 class ParentJobStructureTests(unittest.TestCase):
@@ -215,15 +238,18 @@ class AggregateStatusTests(unittest.TestCase):
 
             try_ffmpeg_reuse spawns via subprocess.Popen. Without this stub the
             test would invoke the host's real ffmpeg, so it would pass only on
-            machines that happen to have it installed.
+            machines that happen to have it installed. It drains a merged
+            stdout pipe on a reader thread, so `stdout` must be an iterable,
+            closeable stream that reaches EOF.
             """
 
             def __init__(self, cmd, **kwargs):
                 Path(cmd[-1]).write_bytes(b"fake audio")
                 self.returncode = 0
+                self.stdout = io.StringIO(FFMPEG_TRANSCRIPT)
 
-            def communicate(self, timeout=None):
-                return b"", b""
+            def wait(self, timeout=None):
+                return self.returncode
 
             def poll(self):
                 return self.returncode
@@ -476,9 +502,10 @@ class MP4MP3ReuseTests(unittest.TestCase):
                     output_file = cmd[-1]
                     Path(output_file).write_bytes(b"fake audio")
                 self.returncode = 0
+                self.stdout = io.StringIO(FFMPEG_TRANSCRIPT)
 
-            def communicate(self, timeout=None):
-                return b"", b""
+            def wait(self, timeout=None):
+                return self.returncode
 
         def video_success(cmd, parent_job_id, progress_target, timeout):
             # Create MP4 file
@@ -538,15 +565,18 @@ class MP4MP3ReuseTests(unittest.TestCase):
 
             try_ffmpeg_reuse spawns via subprocess.Popen, so patching
             subprocess.run here would be a no-op and the test would silently
-            depend on a real ffmpeg being installed on the host.
+            depend on a real ffmpeg being installed on the host. It drains a
+            merged stdout pipe on a reader thread, so `stdout` must be an
+            iterable, closeable stream that reaches EOF.
             """
 
             def __init__(self, cmd, **kwargs):
                 self.cmd = cmd
                 self.returncode = 1
+                self.stdout = io.StringIO(FFMPEG_FAILURE_TRANSCRIPT)
 
-            def communicate(self, timeout=None):
-                return b"", b"ffmpeg error"
+            def wait(self, timeout=None):
+                return self.returncode
 
             def poll(self):
                 return self.returncode

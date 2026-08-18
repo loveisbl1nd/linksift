@@ -20,6 +20,20 @@ EXPECTED_STATUS_FIELDS = {
     "started_at",
     "attempt",
     "max_attempts",
+    # Packaging (ffmpeg) progress, added additively. They mirror the current
+    # artifact while it is being packaged and are null otherwise, so a client
+    # that ignores them sees exactly the response it saw before.
+    "processed_seconds",
+    "duration_seconds",
+    "processing_speed",
+}
+
+# The pre-packaging-progress contract. Every one of these must survive, which is
+# what makes the addition above additive rather than breaking.
+LEGACY_STATUS_FIELDS = EXPECTED_STATUS_FIELDS - {
+    "processed_seconds",
+    "duration_seconds",
+    "processing_speed",
 }
 
 
@@ -62,6 +76,13 @@ class StatusQueueFieldsTests(unittest.TestCase):
         app.jobs[job_id] = {"id": job_id, "status": "downloading", "phase": "downloading", "started_at": 5.0}
         payload = self.client.get(f"/api/status/{job_id}").get_json()
         self.assertEqual(set(payload), EXPECTED_STATUS_FIELDS)
+        # Additive, not breaking: nothing a pre-packaging client read went away.
+        self.assertTrue(LEGACY_STATUS_FIELDS.issubset(set(payload)))
+        # A job that never packages reports the new fields as null rather than
+        # omitting them, so the response shape stays constant across phases.
+        for field in ("processed_seconds", "duration_seconds", "processing_speed"):
+            with self.subTest(field=field):
+                self.assertIsNone(payload[field])
 
     def test_started_at_transitions_from_null_to_timestamp(self):
         job_id = "startstamp"

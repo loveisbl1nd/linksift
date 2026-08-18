@@ -13,13 +13,14 @@ Two defects motivated this file.
    different user-visible outcome reached through a different cleanup path.
 
 2. The ``except`` clause caught only ``TimeoutExpired``. Any other exception out
-   of ``communicate()`` (``OSError`` from a broken pipe, ``ValueError`` from a
+   of ``process.wait()`` (``OSError`` from a broken pipe, ``ValueError`` from a
    closed fd) skipped ``terminate_and_reap`` and unwound straight through
    ``finally``, leaving a live ffmpeg still holding its output file.
 
 Everything here drives a fake Popen. No ffmpeg, no yt-dlp, no network. Time is
 controlled by patching ``time.monotonic`` rather than by sleeping.
 """
+import io
 import os
 import subprocess
 import tempfile
@@ -34,6 +35,20 @@ import app
 
 JOB = "9911223344"
 
+# What a real ffmpeg writes on the MERGED stream try_ffmpeg_reuse reads: the
+# input dump carrying `Duration:` plus the unindented key=value blocks of
+# `-progress pipe:1`. Kept short so the reader thread reaches EOF at once.
+FFMPEG_TRANSCRIPT = (
+    "ffmpeg version 6.0\n"
+    "  Duration: 00:00:15.00, start: 0.000000, bitrate: 129 kb/s\n"
+    "out_time=00:00:07.50\n"
+    "speed=12.3x\n"
+    "progress=continue\n"
+    "out_time=00:00:15.00\n"
+    "speed=12.5x\n"
+    "progress=end\n"
+)
+
 
 def _fake_run(*_args, **_kwargs):
     """Stub for subprocess.run, used by the Windows taskkill path in
@@ -43,44 +58,45 @@ def _fake_run(*_args, **_kwargs):
 
 
 class ControlledFFmpeg:
-    """A fake ffmpeg whose communicate() runs a caller-supplied hook.
+    """A fake ffmpeg whose wait() runs a caller-supplied hook.
 
     The hook is what makes these tests deterministic: it fires at exactly the
     moment ffmpeg "finishes", which is the window both fixes are about.
+    ``try_ffmpeg_reuse`` blocks in ``wait()`` while a reader thread drains the
+    merged pipe, so ``stdout`` must be an iterable, closeable stream that ends.
     """
 
     instances = []
 
-    def __init__(self, cmd, on_communicate=None, returncode=0, write_output=True, **kwargs):
+    def __init__(self, cmd, on_finish=None, returncode=0, write_output=True, **kwargs):
         self.cmd = cmd
         self.pid = 4242 + len(ControlledFFmpeg.instances)
         self._alive = True
         self.returncode = None
         self._final_returncode = returncode
         self._write_output = write_output
-        self._on_communicate = on_communicate
+        self._on_finish = on_finish
         self.terminate_calls = 0
         self.kill_calls = 0
         self.wait_calls = 0
+        self.stdout = io.StringIO(FFMPEG_TRANSCRIPT)
         self.temp_output = cmd[-1]
         ControlledFFmpeg.instances.append(self)
 
     def poll(self):
         return None if self._alive else self.returncode
 
-    def communicate(self, timeout=None):
-        if self._write_output:
-            Path(self.temp_output).write_bytes(b"mp3-audio")
-        self._alive = False
-        self.returncode = self._final_returncode
-        if self._on_communicate is not None:
-            self._on_communicate()
-        return "", ""
-
     def wait(self, timeout=None):
         self.wait_calls += 1
-        self._alive = False
-        if self.returncode is None:
+        if self._alive:
+            # This is the "ffmpeg just exited" instant the tests hang off.
+            if self._write_output:
+                Path(self.temp_output).write_bytes(b"mp3-audio")
+            self._alive = False
+            self.returncode = self._final_returncode
+            if self._on_finish is not None:
+                self._on_finish()
+        elif self.returncode is None:
             self.returncode = self._final_returncode
         return self.returncode
 
@@ -152,11 +168,11 @@ class ReusePublicationTestBase(unittest.TestCase):
     def final_path(self):
         return os.path.join(self.tmp.name, "%s.a001.mp3" % JOB)
 
-    def run_reuse_with_clock(self, on_communicate, deadline=1000.0, start=900.0):
+    def run_reuse_with_clock(self, on_finish, deadline=1000.0, start=900.0):
         """Drive try_ffmpeg_reuse with a fake clock.
 
         `deadline` is a monotonic timestamp. The clock starts before it (so the
-        spawn gate and communicate() see budget remaining) and `on_communicate`
+        spawn gate and wait() see budget remaining) and `on_finish`
         may push it past the deadline, simulating the budget running out while
         ffmpeg ran. No real time passes.
         """
@@ -166,11 +182,11 @@ class ReusePublicationTestBase(unittest.TestCase):
         clock = {"now": start}
 
         def hook():
-            on_communicate(clock)
+            on_finish(clock)
 
         with patch.object(app.time, "monotonic", lambda: clock["now"]), \
                 patch.object(subprocess, "Popen",
-                             side_effect=lambda *a, **k: ControlledFFmpeg(*a, on_communicate=hook, **k)), \
+                             side_effect=lambda *a, **k: ControlledFFmpeg(*a, on_finish=hook, **k)), \
                 patch.object(subprocess, "run", side_effect=_fake_run):
             outcome = {}
             try:
@@ -199,11 +215,11 @@ class DeadlineBeforePublicationTests(ReusePublicationTestBase):
 
     @staticmethod
     def _make_cancel_only_before_publication():
-        """Patch cancel_requested to be False until after the post-communicate
+        """Patch cancel_requested to be False until after the post-wait
         check, then True - exercising the PRE-publication guard specifically.
 
         try_ffmpeg_reuse calls cancel_requested twice: once right after
-        communicate() returns and once right before os.replace. A cancellation
+        wait() returns and once right before os.replace. A cancellation
         that arrives in between is the exact race the pre-publication guard
         exists for. Returning False the first time lets the first check pass
         so the second check is the one that has to fire.
@@ -256,7 +272,7 @@ class DeadlineBeforePublicationTests(ReusePublicationTestBase):
         self.assertFalse(os.path.isfile(self.temp_path))
 
     def test_cancellation_in_the_pre_publication_window_only(self):
-        """Cancellation arriving AFTER the post-communicate check but BEFORE
+        """Cancellation arriving AFTER the post-wait check but BEFORE
         os.replace must still raise PipelineCancelled and not publish.
 
         This is the exact window the pre-publication guard exists for. Using a
@@ -362,7 +378,7 @@ class PipelineTimeoutStatusTests(ReusePublicationTestBase):
         cleanup.assert_not_called()
 
 
-class UnexpectedCommunicateErrorTests(ReusePublicationTestBase):
+class UnexpectedProcessErrorTests(ReusePublicationTestBase):
     """An unexpected exception must reap the process, not leak it."""
 
     def _run_with_error(self, exc):
@@ -372,7 +388,10 @@ class UnexpectedCommunicateErrorTests(ReusePublicationTestBase):
         deadline = time.monotonic() + 300.0
 
         class ExplodingFFmpeg(ControlledFFmpeg):
-            def communicate(self, timeout=None):
+            def wait(self, timeout=None):
+                if not self._alive:
+                    # terminate_and_reap's own wait must still succeed.
+                    return super().wait(timeout=timeout)
                 # Deliberately still alive: this is exactly the state that used
                 # to leak a running ffmpeg past the end of the function.
                 raise exc
@@ -440,7 +459,10 @@ class UnexpectedCommunicateErrorTests(ReusePublicationTestBase):
         newer = object()
 
         class ReplacingFFmpeg(ControlledFFmpeg):
-            def communicate(self, timeout=None):
+            def wait(self, timeout=None):
+                if not self._alive:
+                    # terminate_and_reap's own wait must still succeed.
+                    return super().wait(timeout=timeout)
                 # The next artifact wins the registry slot before this one's
                 # cleanup runs.
                 app.processes[JOB] = newer

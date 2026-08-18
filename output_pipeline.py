@@ -156,6 +156,12 @@ def plan_artifacts(outputs):
             "attempt": None,
             "max_attempts": None,
             "source": None,
+            # Packaging (ffmpeg) progress. Always present so /api/status can
+            # report the same shape for every artifact, whether or not it ever
+            # reaches the packaging step.
+            "processed_seconds": None,
+            "duration_seconds": None,
+            "processing_speed": None,
         }
         artifacts.append(artifact)
 
@@ -221,9 +227,28 @@ def is_intermediate_file(path):
 
 
 def build_ytdlp_command(url, job_id, artifact, download_dir, progress_prefix, postprocess_prefix,
-                         concurrent_fragments, runtime_args):
-    """Build the yt-dlp argv list for downloading one artifact."""
-    out_template = artifact_output_template(job_id, artifact["id"], download_dir)
+                         concurrent_fragments, runtime_args, youtube_client=None,
+                         output_template=None):
+    """Build the yt-dlp argv list for downloading one artifact.
+
+    ``youtube_client`` forces a specific YouTube player client via
+    ``--extractor-args youtube:player_client=<client>``. It is namespaced under
+    the ``youtube`` extractor, so it coexists with the ``youtubepot-bgutilhttp``
+    extractor args already present in ``runtime_args`` -- yt-dlp merges repeated
+    ``--extractor-args`` flags per extractor rather than overwriting them. Left
+    at None the default client is used, which must stay the first-attempt
+    behaviour because some videos disable embedding.
+
+    ``output_template`` overrides the artifact-scoped ``-o`` template. The legacy
+    single-output path owns a different filename contract
+    (``<job_id>.%(ext)s`` instead of ``<job_id>.<artifact_id>.%(ext)s``) and
+    passes its own template so both paths can share this one builder without
+    either changing the files it produces.
+
+    A fresh list is constructed on every call, so a caller retrying with a
+    different client never mutates or aliases a previously spawned argv.
+    """
+    out_template = output_template or artifact_output_template(job_id, artifact["id"], download_dir)
     cmd = [
         "yt-dlp",
         "--no-playlist",
@@ -241,6 +266,8 @@ def build_ytdlp_command(url, job_id, artifact, download_dir, progress_prefix, po
         "--retry-sleep", "fragment:exp=1:20",
     ]
     cmd.extend(runtime_args)
+    if youtube_client:
+        cmd.extend(["--extractor-args", f"youtube:player_client={youtube_client}"])
     cmd.extend(["-o", out_template])
 
     if artifact["type"] == "audio":
@@ -258,16 +285,179 @@ def build_ffmpeg_extract_command(source_mp4, output_mp3):
     """Build ffmpeg argv list to extract audio from a completed MP4.
 
     Uses libmp3lame at 320k CBR. No shell=True.
+
+    ``-progress pipe:1`` makes ffmpeg emit machine-readable ``key=value`` blocks
+    on stdout while it works, so packaging reports real progress instead of
+    sitting at a fixed percentage until the process exits. ``-nostats``
+    suppresses the human-readable carriage-return status line that would
+    otherwise interleave with the log on stderr; the input metadata dump (which
+    carries the ``Duration:`` line the reader needs) is unaffected, so the
+    duration comes from ffmpeg itself with no extra ffprobe subprocess.
+
+    Both are global options and are placed before ``-i`` so they apply to the
+    run rather than to the output file.
     """
     return [
         "ffmpeg",
         "-y",
+        "-nostats",
+        "-progress", "pipe:1",
         "-i", source_mp4,
         "-vn",
         "-acodec", "libmp3lame",
         "-b:a", "320k",
         output_mp3,
     ]
+
+
+# ``Duration: 00:01:23.11, start: 0.000000, bitrate: 129 kb/s``. Hours are not
+# zero-padded to two digits for very long inputs, hence ``\d+``.
+FFMPEG_DURATION_PATTERN = re.compile(r"\bDuration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
+
+# A ``-progress`` line is an unindented ``key=value``. Metadata lines from the
+# input dump are indented and use ``key : value``, so they cannot match.
+FFMPEG_PROGRESS_LINE_PATTERN = re.compile(r"^([a-z][a-z0-9_]*)=(.*)$")
+
+FFMPEG_TIMESTAMP_PATTERN = re.compile(r"^(-?)(\d+):(\d{2}):(\d{2}(?:\.\d+)?)$")
+
+FFMPEG_SPEED_PATTERN = re.compile(r"^(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)x$")
+
+# Keys carrying the position reached in the input, best first. ``out_time`` is
+# an unambiguous timestamp; ``out_time_us`` is microseconds by name and by
+# behaviour. ``out_time_ms`` is deliberately last: ffmpeg has emitted
+# MICROseconds under that name for years, so it is only trusted as a fallback
+# and is read with the same microsecond scale ffmpeg actually uses.
+FFMPEG_TIME_KEYS = ("out_time", "out_time_us", "out_time_ms")
+
+
+def _finite(value):
+    """float(value) when it is a real, finite number; None otherwise.
+
+    Mirrors app.finite_number so the pure module stays importable on its own.
+    NaN, infinities and booleans are rejected rather than propagated into a
+    percentage.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def parse_ffmpeg_duration(line):
+    """Total input seconds from an ffmpeg ``Duration:`` line, else None.
+
+    ``Duration: N/A`` (streams with no known length) does not match, which is
+    what keeps an unknown duration indeterminate instead of inventing one.
+    """
+    if not isinstance(line, str):
+        return None
+    match = FFMPEG_DURATION_PATTERN.search(line)
+    if not match:
+        return None
+    hours, minutes, seconds = match.groups()
+    total = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    return total if total > 0 else None
+
+
+def parse_ffmpeg_progress_line(line):
+    """``(key, value)`` for one ffmpeg ``-progress`` line, else None."""
+    if not isinstance(line, str):
+        return None
+    match = FFMPEG_PROGRESS_LINE_PATTERN.match(line)
+    if not match:
+        return None
+    return match.group(1), match.group(2).strip()
+
+
+def ffmpeg_progress_seconds(key, value):
+    """Seconds processed, from one of the ``out_time*`` keys, else None.
+
+    Negative positions (ffmpeg emits ``-577014:32:22.000000`` before the first
+    frame is written) and ``N/A`` are rejected, not clamped to zero, so they
+    never register as progress.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or value == "N/A":
+        return None
+
+    if key == "out_time":
+        match = FFMPEG_TIMESTAMP_PATTERN.match(value)
+        if not match:
+            return None
+        sign, hours, minutes, seconds = match.groups()
+        if sign == "-":
+            return None
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+    if key in ("out_time_us", "out_time_ms"):
+        number = _finite(value)
+        if number is None or number < 0:
+            return None
+        return number / 1_000_000.0
+
+    return None
+
+
+def parse_ffmpeg_speed(value):
+    """Processing speed multiplier from ``speed=12.3x``, else None."""
+    if not isinstance(value, str):
+        return None
+    match = FFMPEG_SPEED_PATTERN.match(value.strip())
+    if not match:
+        return None
+    speed = _finite(match.group(1))
+    if speed is None or speed <= 0:
+        return None
+    return speed
+
+
+def compute_processing_percent(processed_seconds, duration_seconds, previous_percent=None):
+    """Percent of the input processed, clamped to 0..100 and never decreasing.
+
+    Returns None when the duration is unknown, so the caller keeps the artifact
+    indeterminate rather than showing a fabricated number. A previously
+    published percent is never lowered: ffmpeg can report a position that dips
+    between blocks, and a progress bar that walks backwards reads as a bug.
+    """
+    processed = _finite(processed_seconds)
+    duration = _finite(duration_seconds)
+    previous = _finite(previous_percent)
+    if previous is not None:
+        previous = min(100.0, max(0.0, previous))
+
+    if processed is None or duration is None or duration <= 0 or processed < 0:
+        return previous
+
+    percent = round(min(100.0, max(0.0, processed * 100.0 / duration)), 1)
+    if previous is not None and percent < previous:
+        return previous
+    return percent
+
+
+def compute_processing_eta(processed_seconds, duration_seconds, speed):
+    """Whole seconds of wall-clock work left, else None.
+
+    ``speed`` is ffmpeg's own multiplier (media seconds per wall-clock second),
+    so remaining media time divided by it is a wall-clock estimate.
+    """
+    processed = _finite(processed_seconds)
+    duration = _finite(duration_seconds)
+    rate = _finite(speed)
+    if processed is None or duration is None or rate is None:
+        return None
+    if duration <= 0 or rate <= 0 or processed < 0:
+        return None
+    remaining = duration - processed
+    if remaining <= 0:
+        return 0
+    return int(round(remaining / rate))
 
 
 def select_video_for_reuse(completed_video_artifacts):
@@ -315,20 +505,38 @@ def compute_aggregate_status(artifacts):
 
 
 def compute_aggregate_progress(artifacts, current_artifact_id):
-    """Compute overall percent: (completed + current_pct/100) / total * 100."""
+    """Compute overall percent: (completed + current_pct/100) / total * 100.
+
+    The current artifact contributes its own fractional progress, so it must be
+    excluded from the completed count while it is being counted fractionally.
+    Otherwise a finished current artifact is counted twice - once as completed
+    and once at 100% - and a two-output job reports 150% the moment its last
+    artifact publishes, because ``current_artifact_id`` keeps pointing at it.
+
+    Any percent outside 0..100 is clamped before it enters the sum, so one bad
+    artifact reading cannot push the aggregate out of range either.
+    """
     total = len(artifacts)
     if total == 0:
         return None
 
-    completed = sum(1 for a in artifacts if a["status"] == "done")
     current_pct = 0.0
+    current_counted = False
     if current_artifact_id is not None:
         for art in artifacts:
-            if art["id"] == current_artifact_id and art.get("percent") is not None:
-                current_pct = art["percent"] / 100.0
+            if art["id"] == current_artifact_id:
+                current_counted = True
+                percent = _finite(art.get("percent"))
+                if percent is not None:
+                    current_pct = min(1.0, max(0.0, percent / 100.0))
                 break
 
-    return round((completed + current_pct) / total * 100, 1)
+    completed = sum(
+        1 for a in artifacts
+        if a["status"] == "done" and not (current_counted and a["id"] == current_artifact_id)
+    )
+
+    return round(min(100.0, (completed + current_pct) / total * 100), 1)
 
 
 def make_artifact_filename(title, artifact):

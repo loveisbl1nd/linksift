@@ -83,6 +83,15 @@ class ArtifactDisplayStateTests(unittest.TestCase):
         prelude = (
             NODE_PRELUDE
             + "\n"
+            # artifactDisplayState now delegates its packaging branch to these
+            # helpers, so the harness has to supply the real ones - stubbing
+            # them here would stop testing the shipped formatting.
+            + function_source(src, "fmtClock")
+            + "\n"
+            + function_source(src, "packagingProcessedText")
+            + "\n"
+            + function_source(src, "packagingPhaseLabel")
+            + "\n"
             + function_source(src, "artifactDisplayState")
             + "\n"
             + body
@@ -122,10 +131,32 @@ class ArtifactDisplayStateTests(unittest.TestCase):
 
     def test_processing_is_not_pending(self):
         out = self.run_state('console.log("RESULT:" + JSON.stringify(artifactDisplayState({status:"processing", phase:"processing"})));')
-        self.assertEqual(out["text"], "Processing…",
+        # The label changed from "Processing…" to a packaging-aware one, but the
+        # defect this test guards is unchanged: processing must never read as
+        # Pending, and with no duration there is nothing honest to draw a bar from.
+        self.assertEqual(out["text"], "Packaging file…",
                          "processing must NOT read as Pending")
+        self.assertNotIn("Pending", out["text"])
         self.assertFalse(out["showProgress"],
-                         "processing shows no progress bar")
+                         "no duration means no progress bar - a bar here would be fabricated")
+
+    def test_processing_with_a_known_duration_reports_real_progress(self):
+        """A packaging artifact that knows its duration shows time, speed and a bar.
+
+        The pre-Round-5 build had no ffmpeg progress at all, so this branch could
+        only ever render the bare "Processing…" label with showProgress false.
+        """
+        out = self.run_state(
+            'console.log("RESULT:" + JSON.stringify(artifactDisplayState('
+            '{status:"processing", phase:"processing", type:"audio",'
+            ' processed_seconds:33.2, duration_seconds:83, processing_speed:12.3})));'
+        )
+        self.assertIn("Processing audio", out["text"])
+        self.assertIn("0:33 / 1:23 processed", out["text"])
+        self.assertIn("12.3", out["text"])
+        self.assertTrue(out["showProgress"],
+                        "a real percent must be allowed to draw a real bar")
+        self.assertFalse(out["canSave"])
 
     def test_done_retains_save_and_no_progress(self):
         out = self.run_state('console.log("RESULT:" + JSON.stringify(artifactDisplayState({status:"done", phase:"done"})));')
@@ -153,13 +184,15 @@ class ArtifactDisplayStateTests(unittest.TestCase):
         self.assertFalse(out["canSave"])
 
     def test_status_processing_with_no_phase(self):
-        """status processing even without a phase must show Processing, not Pending."""
+        """status processing even without a phase must show packaging, not Pending."""
         out = self.run_state('console.log("RESULT:" + JSON.stringify(artifactDisplayState({status:"processing"})));')
-        self.assertEqual(out["text"], "Processing…")
+        self.assertEqual(out["text"], "Packaging file…")
+        self.assertNotIn("Pending", out["text"])
 
     def test_postprocessing_phase_is_accepted(self):
         out = self.run_state('console.log("RESULT:" + JSON.stringify(artifactDisplayState({status:"downloading", phase:"postprocessing"})));')
-        self.assertEqual(out["text"], "Processing…")
+        self.assertEqual(out["text"], "Packaging file…")
+        self.assertNotIn("Pending", out["text"])
 
 
 class ArtifactSignatureTests(unittest.TestCase):

@@ -66,6 +66,10 @@
       --font-sans: "Inter", system-ui, "Segoe UI", Roboto, sans-serif;
       --font-serif: "Instrument Serif", Georgia, serif;
       --font-mono: "DM Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      /* Vietnamese-capable stack for dynamic metadata (titles, uploader).
+         Instrument Serif lacks coverage for Vietnamese combining marks, so
+         provider-returned text is rendered with this sans stack instead. */
+      --font-sans-vi: var(--font-sans), "Segoe UI", system-ui, sans-serif;
     }
 
     html[data-theme="light"] {
@@ -173,8 +177,15 @@
     .format-switch button { flex: 1 1 0; }
     .format-switch button, .folder-btn, .filter-btn { border: 1px solid var(--line); background: transparent; color: var(--text-soft); border-radius: var(--radius-sm); min-height: 40px; padding: 0 14px; cursor: pointer; font-size: 13.5px; font-weight: 500; transition: background var(--motion-fast) var(--ease-out), color var(--motion-fast) var(--ease-out), border-color var(--motion-fast) var(--ease-out); }
     .format-switch button[aria-pressed="true"] { border-color: color-mix(in srgb, var(--accent) 70%, transparent); color: var(--accent); background: var(--accent-tint); }
-    .format-switch button::before, .filter-btn::before, .chip.quality::before { content: "✓"; display: inline-block; width: 1.05em; margin-right: 2px; opacity: 0; transform: scale(.7); transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out); }
-    .format-switch button[aria-pressed="true"]::before, .filter-btn[aria-pressed="true"]::before, .chip.quality[aria-pressed="true"]::before { opacity: 1; transform: scale(1); }
+    /* Selection check indicator. The previous design drew the checkmark with
+       content: "✓" on a ::before pseudo-element, which depends on the
+       page font having a glyph for U+2713. It is now an inline SVG so the
+       check is independent of any font. A fixed footprint keeps the button
+       width stable when the indicator toggles, and aria-pressed stays the only
+       source of truth for whether it is shown. */
+    .selection-check { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; margin-right: 2px; opacity: 0; transform: scale(.7); transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out); }
+    .selection-check .icon { opacity: 1; }
+    .format-switch button[aria-pressed="true"] .selection-check, .filter-btn[aria-pressed="true"] .selection-check, .chip.quality[aria-pressed="true"] .selection-check { opacity: 1; transform: scale(1); }
     .folder-btn { margin-top: 10px; width: 100%; min-width: 0; text-align: left; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
     .folder-btn > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .folder-btn:disabled { cursor: not-allowed; opacity: .6; }
@@ -197,6 +208,9 @@
       .card:hover .card-thumb img { transform: scale(1.025); }
       .folder-btn:hover:not(:disabled), .format-switch button:hover, .filter-btn:hover, .chip.quality:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--text); }
     }
+    /* Keyboard parity: focus-within must live OUTSIDE the (hover: hover) query
+       so keyboard and touch users get the same rounded interaction shape. */
+    .card:focus-within { background: linear-gradient(90deg, var(--accent-tint), transparent 46%); }
     @media (prefers-reduced-motion: no-preference) {
       .inspect-btn:active:not(:disabled), .download-btn:active:not(:disabled) { transform: scale(.98); transition-duration: 120ms; }
     }
@@ -215,21 +229,36 @@
     .filter-btn { min-height: 36px; padding: 0 12px; border-radius: 999px; font-size: 12.5px; }
     .filter-btn[aria-pressed="true"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 70%, transparent); background: var(--accent-tint); }
     .download-all { min-height: 36px; padding: 0 14px; font-size: 13px; border-radius: 999px; }
-    .cards { padding: 2px 20px 10px; min-width: 0; }
-    .card { display: grid; grid-template-columns: 118px minmax(0, 1fr) auto; gap: 16px; padding: 16px 0; border-bottom: 1px solid var(--line-soft); background: transparent; transition: background var(--motion-fast) var(--ease-out); min-width: 0; animation: card-in var(--motion-slow) var(--ease-out) both; }
-    .card:last-child { border-bottom: 0; }
+    .cards { padding: 2px 8px 10px; min-width: 0; }
+    /* The card owns 12px of horizontal padding while .cards gives up the same
+       amount, so the total inset (8+12=20px) still matches .manifest-head and
+       the hover/focus background can round off inside the row instead of being
+       cut flush against the left edge. No negative margins: .manifest has
+       overflow:hidden and would clip them. */
+    .card { position: relative; display: grid; grid-template-columns: 118px minmax(0, 1fr) auto; gap: 16px; padding: 16px 12px; border-radius: var(--radius-md); background: transparent; transition: background var(--motion-fast) var(--ease-out); min-width: 0; animation: card-in var(--motion-slow) var(--ease-out) both; }
+    /* Separator drawn as an inset pseudo-element rather than border-bottom: a
+       border on a rounded box curves up at the corners and reads as a broken
+       line. This keeps a straight rule that is independent of the radius. */
+    .card::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: 0; height: 1px; background: var(--line-soft); }
+    .card:last-child::after { display: none; }
     .card[hidden] { display: none; }
     .card[data-status="downloading"], .card[data-status="queued"] { box-shadow: inset 3px 0 0 var(--accent-strong); }
     .card[data-status="error"], .card[data-status="info-error"], .card[data-status="timed_out"] { background: linear-gradient(90deg, var(--danger-bg), transparent 42%); }
     .card-thumb { width: 118px; height: 72px; border-radius: var(--radius-sm); overflow: hidden; background: var(--surface-raised); display: grid; place-items: center; color: var(--muted); }
     .card-thumb img { width: 100%; height: 100%; object-fit: cover; transition: transform .2s ease; }
     .card-body { min-width: 0; max-width: 68ch; }
-    .card-title { margin: 0; color: var(--text); font-family: var(--font-serif); font-size: 21px; font-weight: 400; line-height: 1.12; letter-spacing: -.25px; overflow-wrap: anywhere; }
+    .card-title { margin: 0; color: var(--text); font-family: var(--font-sans-vi); font-size: 21px; font-weight: 600; line-height: 1.22; letter-spacing: -.005em; overflow-wrap: anywhere; }
     .card-meta { margin-top: 5px; color: var(--muted); font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere; }
     .chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; }
-    .chip { display: inline-flex; align-items: center; min-height: 28px; border: 1px solid var(--line); color: var(--text-soft); border-radius: 999px; padding: 0 10px; background: var(--surface-raised); font-family: var(--font-mono); font-size: 12px; }
+    .chip { display: inline-flex; align-items: center; gap: 5px; min-height: 28px; border: 1px solid var(--line); color: var(--text-soft); border-radius: 999px; padding: 0 10px; background: var(--surface-raised); font-family: var(--font-mono); font-size: 12px; }
     .chip.quality { cursor: pointer; }
+    .chip .icon { flex: none; opacity: .75; }
+    .chip.quality[aria-pressed="true"] .icon { opacity: 1; }
     .chip.quality[aria-pressed="true"] { border-color: color-mix(in srgb, var(--accent) 70%, transparent); color: var(--accent); background: var(--accent-tint); }
+    /* The type icon and the selection check sit side by side in the flex row,
+       so neither overlaps the other. */
+    .card-actions .download-btn, .retry-btn, .artifact-save-btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+    .card-actions .icon, .artifact-save-btn .icon { flex: none; }
     .chip-static { border-color: transparent; background: transparent; padding: 0 4px; color: var(--muted); }
     .chip.quality { transition: background var(--motion-fast) var(--ease-out), color var(--motion-fast) var(--ease-out), border-color var(--motion-fast) var(--ease-out); }
     .card-actions { display: flex; min-width: 172px; flex-direction: column; align-items: stretch; justify-content: center; gap: 8px; }
@@ -364,7 +393,7 @@
       .manifest-controls { justify-content: flex-start; }
       .filter-btn { min-height: 44px; }
       .download-all { min-height: 44px; }
-      .cards { padding: 2px 16px 10px; }
+      .cards { padding: 2px 4px 10px; }
       .chips { gap: 8px; }
       .chip.quality { min-height: 44px; padding: 0 14px; }
       .error-details summary { min-height: 44px; }
@@ -428,8 +457,8 @@
               <section class="pref" aria-labelledby="format-heading">
                 <div class="choice-title" id="format-heading">Preferred format</div>
                 <div class="format-switch" role="group" aria-label="Preferred media format">
-                  <button type="button" data-format="video" aria-pressed="true">MP4 video</button>
-                  <button type="button" data-format="audio" aria-pressed="false">MP3 audio</button>
+                  <button type="button" data-format="video" aria-pressed="true"><span class="selection-check" aria-hidden="true"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 6 9 17l-5-5"/></svg></span>MP4 video</button>
+                  <button type="button" data-format="audio" aria-pressed="false"><span class="selection-check" aria-hidden="true"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 6 9 17l-5-5"/></svg></span>MP3 audio</button>
                 </div>
               </section>
               <section class="pref" aria-labelledby="save-heading">
@@ -450,11 +479,11 @@
             <div class="manifest-head">
               <div><h2 id="manifest-heading">Download queue</h2><p class="manifest-summary" id="manifestSummary" aria-live="polite"></p></div>
               <div class="manifest-controls">
-                <button type="button" class="filter-btn" data-filter="all" aria-pressed="true">All</button>
-                <button type="button" class="filter-btn" data-filter="ready" aria-pressed="false">Ready</button>
-                <button type="button" class="filter-btn" data-filter="downloading" aria-pressed="false">Active</button>
-                <button type="button" class="filter-btn" data-filter="done" aria-pressed="false">Complete</button>
-                <button type="button" class="filter-btn" data-filter="issues" aria-pressed="false">Issues</button>
+                <button type="button" class="filter-btn" data-filter="all" aria-pressed="true"><span class="selection-check" aria-hidden="true"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 6 9 17l-5-5"/></svg></span>All</button>
+                <button type="button" class="filter-btn" data-filter="ready" aria-pressed="false"><span class="selection-check" aria-hidden="true"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 6 9 17l-5-5"/></svg></span>Ready</button>
+                <button type="button" class="filter-btn" data-filter="downloading" aria-pressed="false"><span class="selection-check" aria-hidden="true"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 6 9 17l-5-5"/></svg></span>Active</button>
+                <button type="button" class="filter-btn" data-filter="done" aria-pressed="false"><span class="selection-check" aria-hidden="true"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 6 9 17l-5-5"/></svg></span>Complete</button>
+                <button type="button" class="filter-btn" data-filter="issues" aria-pressed="false"><span class="selection-check" aria-hidden="true"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 6 9 17l-5-5"/></svg></span>Issues</button>
                 <button type="button" class="download-btn download-all" id="downloadAllBtn">Download ready</button>
               </div>
             </div>
@@ -742,10 +771,46 @@
       return hours ? `${hours}h ${minutes}m` : minutes ? `${minutes}m ${secs}s` : `${secs}s`;
     }
 
+    // Media position as a clock reading (`42:10`, `1:23:11`). Distinct from
+    // fmtEta, which describes a duration ("2m 5s"); a playback position reads
+    // wrong in that form. Returns '' for anything that is not a real, finite,
+    // non-negative number, so a malformed field renders nothing rather than
+    // "NaN:NaN".
+    function fmtClock(seconds) {
+      const value = Number(seconds);
+      if (!Number.isFinite(value) || value < 0) return '';
+      const total = Math.floor(value);
+      const hours = Math.floor(total / 3600);
+      const minutes = Math.floor((total % 3600) / 60);
+      const secs = total % 60;
+      const pad = n => String(n).padStart(2, '0');
+      return hours ? `${hours}:${pad(minutes)}:${pad(secs)}` : `${minutes}:${pad(secs)}`;
+    }
+
+    // Inline decorative SVG icons. All are aria-hidden and use currentColor so
+    // they inherit the button's selected/unselected colour; none of them
+    // replaces a text label. No icon font, package, or CDN is involved.
+    const ICON_ATTRS = 'class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"';
+    const ICON_VIDEO = `<svg ${ICON_ATTRS}><rect x="2" y="5" width="14" height="14" rx="2"/><path d="m16 11 6-3v8l-6-3z"/></svg>`;
+    const ICON_AUDIO = `<svg ${ICON_ATTRS}><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
+    const ICON_DOWNLOAD = `<svg ${ICON_ATTRS}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>`;
+    const ICON_SAVE = `<svg ${ICON_ATTRS}><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>`;
+    const ICON_RETRY = `<svg ${ICON_ATTRS}><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>`;
+    const ICON_CANCEL = `<svg ${ICON_ATTRS}><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>`;
+    const ICON_CHECK = `<svg ${ICON_ATTRS}><path d="M20 6 9 17l-5-5"/></svg>`;
+
     function esc(value) {
       const element = document.createElement('div');
       element.textContent = value == null ? '' : String(value);
       return element.innerHTML;
+    }
+
+    // Normalize a string to Unicode NFC so decomposed combining marks from
+    // provider metadata (e.g. "tiếng") collapse to the precomposed
+    // form ("tiếng") for stable rendering. Only applies to human-readable
+    // text; URL, job IDs, and format IDs must never be touched.
+    function normalizeText(value) {
+      return typeof value === 'string' ? value.normalize('NFC') : value;
     }
 
     function friendlyError(error) {
@@ -832,6 +897,37 @@
       setLiveText('queueDetail', `${counts.done} complete · ${counts.ready} waiting`);
     }
 
+    // Type of the artifact the parent job is currently working on, so the
+    // parent row can name its packaging step. Null whenever the payload does
+    // not identify one.
+    function currentArtifactType(data) {
+      if (!data || !Array.isArray(data.artifacts) || !data.current_artifact_id) return null;
+      const current = data.artifacts.find(a => a && a.id === data.current_artifact_id);
+      return current ? current.type : null;
+    }
+
+    // `42:10 / 1:23:11 processed`, or '' when the input length is unknown.
+    // Both halves are required: a position without a total is not progress the
+    // user can read, and a fabricated total would be worse than none.
+    function packagingProcessedText(source) {
+      const processed = Number(source && source.processedSeconds);
+      const duration = Number(source && source.durationSeconds);
+      if (!Number.isFinite(processed) || processed < 0) return '';
+      if (!Number.isFinite(duration) || duration <= 0) return '';
+      const left = fmtClock(Math.min(processed, duration));
+      const right = fmtClock(duration);
+      if (!left || !right) return '';
+      return `${left} / ${right} processed`;
+    }
+
+    // The audio artifact is the one ffmpeg packages from a finished MP4, so
+    // that step is named for what it produces. Anything else keeps the generic
+    // label yt-dlp's own postprocessing step has always used.
+    function packagingPhaseLabel(source) {
+      const isAudio = source && (source.type === 'audio' || source.packagingType === 'audio');
+      return isAudio ? 'Processing audio' : 'Packaging file';
+    }
+
     function progressParts(card) {
       if (card.status === 'queued') {
         const position = Number.isFinite(card.queuePosition) && card.queuePosition >= 1 ? Math.round(card.queuePosition) : null;
@@ -847,10 +943,30 @@
       const hasPercent = Number.isFinite(card.percent);
       const percent = hasPercent ? Math.max(0, Math.min(100, card.percent)) : 34;
       const retrying = card.phase === 'retrying';
-      const phase = card.phase === 'processing' ? 'Packaging file'
+      // Packaging reports real ffmpeg progress, so it gets its own size/ETA
+      // line: byte counts describe the download that already finished and
+      // would otherwise leave the row reading "Waiting for data" for the whole
+      // packaging step.
+      const packaging = card.phase === 'processing' || card.phase === 'postprocessing';
+      const phase = packaging ? packagingPhaseLabel(card)
         : card.phase === 'starting' ? 'Starting download'
         : retrying ? (Number.isFinite(card.attempt) && Number.isFinite(card.maxAttempts) ? `Retrying — attempt ${card.attempt} of ${card.maxAttempts}` : 'Retrying')
         : 'Downloading';
+      if (packaging) {
+        const processedText = packagingProcessedText(card);
+        const speedText = Number.isFinite(card.processingSpeed) && card.processingSpeed > 0
+          ? ` · ${card.processingSpeed.toFixed(1)}×` : '';
+        return {
+          hasPercent,
+          percent,
+          phase,
+          // No duration means no honest number to show, so the row says so
+          // rather than inventing one; the bar is indeterminate in that case.
+          size: (processedText || 'Processing…') + speedText,
+          eta: Number.isFinite(card.eta) && card.eta >= 0 ? `${fmtEta(card.eta)} left` : '',
+          reconnecting: false,
+        };
+      }
       const sizeBase = card.totalBytes ? `${fmtBytes(card.downloadedBytes)} / ${fmtBytes(card.totalBytes)}` : card.downloadedBytes ? fmtBytes(card.downloadedBytes) : 'Waiting for data';
       const speed = Number.isFinite(card.speed) && card.speed > 0 ? ` · ${fmtBytes(card.speed)}/s` : '';
       const reconnecting = Boolean(card.reconnecting);
@@ -914,18 +1030,21 @@
       const isDone = card.status === 'done';
       const isError = card.status === 'error';
 
-      // Fast path: when only numeric progress changed, patch the progress bar
-      // in place instead of rebuilding the card. The artifact signature guards
-      // multi-output jobs: if an artifact's status/percent/save state changed we
-      // fall through to a full render so per-artifact Save buttons appear.
-      // Every field an artifact row RENDERS must be in the signature (see
-      // artifactSignature). A phase change (downloading -> retrying) leaves
-      // status and percent untouched, so omitting phase pinned the row on a
-      // stale label.
+      // Fast path: when only numeric progress changed, patch the parent bar
+      // and each artifact row in place instead of rebuilding the card. The
+      // artifact signature guards structure: if an artifact's status, phase,
+      // save state, or "does it have a duration" bit changed we fall through
+      // to a full render so Save buttons appear and bars are created. Live
+      // numbers (percent, processed_seconds, processing_speed) are patched
+      // by patchArtifactRows and must NOT force a rebuild -- that would drop
+      // Cancel's focus, its hover/focus-visible, every bound listener, and
+      // the artifact objects saveArtifact holds across an await. A phase
+      // change (downloading -> retrying) leaves status and percent untouched,
+      // so omitting phase used to pin the row on a stale label.
       const artSig = artifactSignature(card);
       if ((isDownloading || isQueued) && (previousStatus === 'downloading' || previousStatus === 'queued') && element.dataset.artSig === artSig) {
         const wrap = element.querySelector('.progress-wrap');
-        if (wrap) {
+        if (wrap && patchArtifactRows(element, card)) {
           updateProgressWrap(wrap, card);
           return;
         }
@@ -940,7 +1059,11 @@
             sel.type === opt.type && sel.format_id === opt.format_id
           );
           const label = opt.label || (opt.type === 'audio' ? 'Audio' : `Video ${opt.format_id}`);
-          return `<button type="button" class="chip quality${isSelected ? ' selected' : ''}" data-output-index="${idx}">${esc(label)}</button>`;
+          // aria-pressed is the single source of truth for selection: the CSS
+          // selected styling and the checkmark both key off it, and screen
+          // readers announce the same state the user sees.
+          const typeIcon = opt.type === 'audio' ? ICON_AUDIO : ICON_VIDEO;
+          return `<button type="button" class="chip quality" data-output-index="${idx}" aria-pressed="${isSelected ? 'true' : 'false'}">${typeIcon}<span class="selection-check">${ICON_CHECK}</span><span class="chip-label">${esc(label)}</span></button>`;
         }).join('');
       }
 
@@ -956,25 +1079,29 @@
           const artState = artifactDisplayState(art);
           const statusClass = artState.cls;
           const statusText = artState.text;
-          const progressPct = art.percent || 0;
-          const saveLabel = art.saving ? 'Saving…' : art.saved ? '✓ Saved' : art.saveError ? 'Retry save' : 'Save';
+          const progressPct = Number.isFinite(art.percent) ? Math.max(0, Math.min(100, art.percent)) : 0;
+          const saveLabel = art.saving ? 'Saving…' : art.saved ? 'Saved' : art.saveError ? 'Retry save' : 'Save';
+          const saveIcon = art.saveError ? ICON_RETRY : ICON_SAVE;
           const saveDisabled = art.saving || art.saved;
           artifactListHtml += `
-            <div class="artifact-item">
+            <div class="artifact-item" data-artifact-id="${esc(art.id)}">
               <div class="artifact-info">
                 <div class="artifact-label">${esc(art.label || (art.type === 'audio' ? 'Audio' : `Video ${art.format_id}`))}</div>
                 <div class="artifact-status ${statusClass}">${statusText}${art.saved ? ' · saved' : ''}${art.saveError ? ` · ${esc(art.saveError)}` : ''}</div>
-                ${artState.showProgress ? `<div class="artifact-progress"><div class="artifact-progress-fill" style="width: ${progressPct}%"></div></div>` : ''}
+                ${artState.showProgress ? `<div class="artifact-progress" role="progressbar" aria-label="${esc(art.label || 'Output')} progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progressPct}"><div class="artifact-progress-fill" style="width: ${progressPct}%"></div></div>` : ''}
               </div>
-              ${artState.canSave ? `<div class="artifact-actions"><button type="button" class="artifact-save-btn" data-artifact-save="${idx}"${saveDisabled ? ' disabled' : ''}>${saveLabel}</button></div>` : ''}
+              ${artState.canSave ? `<div class="artifact-actions"><button type="button" class="artifact-save-btn" data-artifact-save="${idx}"${saveDisabled ? ' disabled' : ''}>${saveIcon}<span>${saveLabel}</span></button></div>` : ''}
             </div>
           `;
         });
         artifactListHtml += '</div>';
       }
 
-      // Format label for single-output or summary for multi-output
+      // Format label for single-output or summary for multi-output.
+      // summaryIcons mirrors the same three branches so the non-ready static
+      // summary carries the same video/audio SVG icons the ready chips use.
       let formatLabel;
+      let summaryIcons;
       if (card.selectedOutputs && card.selectedOutputs.length > 1) {
         const videoCount = card.selectedOutputs.filter(o => o.type === 'video').length;
         const audioCount = card.selectedOutputs.filter(o => o.type === 'audio').length;
@@ -982,11 +1109,17 @@
         if (videoCount > 0) parts.push(`${videoCount} video${videoCount > 1 ? 's' : ''}`);
         if (audioCount > 0) parts.push('audio');
         formatLabel = parts.join(' + ');
+        // A mixed summary shows BOTH icons, in the same order as the label.
+        summaryIcons = `${videoCount > 0 ? ICON_VIDEO : ''}${audioCount > 0 ? ICON_AUDIO : ''}`;
       } else if (card.selectedOutputs && card.selectedOutputs.length === 1) {
         const sel = card.selectedOutputs[0];
-        formatLabel = sel.type === 'audio' ? 'MP3 audio' : `MP4 video ${sel.format_id || ''}`.trim();
+        const isAudio = sel.type === 'audio';
+        formatLabel = isAudio ? 'MP3 audio' : `MP4 video ${sel.format_id || ''}`.trim();
+        summaryIcons = isAudio ? ICON_AUDIO : ICON_VIDEO;
       } else {
-        formatLabel = card.downloadFormat === 'audio' || (!card.downloadFormat && currentFormat === 'audio') ? 'MP3 audio' : 'MP4 video';
+        const isAudio = card.downloadFormat === 'audio' || (!card.downloadFormat && currentFormat === 'audio');
+        formatLabel = isAudio ? 'MP3 audio' : 'MP4 video';
+        summaryIcons = isAudio ? ICON_AUDIO : ICON_VIDEO;
       }
 
       let statusHtml = '';
@@ -1009,16 +1142,16 @@
       }
 
       const action = (isDownloading || isQueued)
-        ? `${statusHtml}<button type="button" class="retry-btn" data-cancel="true">Cancel</button>`
+        ? `${statusHtml}<button type="button" class="retry-btn" data-cancel="true">${ICON_CANCEL}<span>Cancel</span></button>`
         : isCancelling ? statusHtml : isDone
-        ? `<button type="button" class="retry-btn" data-save="true">Save again</button>${statusHtml}`
+        ? `<button type="button" class="retry-btn" data-save="true">${ICON_SAVE}<span>Save again</span></button>${statusHtml}`
         : (isError || isTimedOut)
-          ? `<button type="button" class="retry-btn" data-download="true">Retry download</button>${statusHtml}`
+          ? `<button type="button" class="retry-btn" data-download="true">${ICON_RETRY}<span>Retry download</span></button>${statusHtml}`
           : isCancelled
-            ? `<button type="button" class="retry-btn" data-download="true">Download again</button>${statusHtml}`
+            ? `<button type="button" class="retry-btn" data-download="true">${ICON_RETRY}<span>Download again</span></button>${statusHtml}`
             : card.status === 'partial'
-              ? `<button type="button" class="retry-btn" data-save="true">Save completed outputs</button>${statusHtml}`
-              : `<button type="button" class="download-btn" data-download="true">${downloadDirectoryHandle ? `Save to ${esc(downloadDirectoryHandle.name)}` : 'Download'}</button>`;
+              ? `<button type="button" class="retry-btn" data-save="true">${ICON_SAVE}<span>Save completed outputs</span></button>${statusHtml}`
+              : `<button type="button" class="download-btn" data-download="true">${ICON_DOWNLOAD}<span>${downloadDirectoryHandle ? `Save to ${esc(downloadDirectoryHandle.name)}` : 'Download'}</span></button>`;
       const thumbnail = card.thumbnail ? '<img alt="">' : '<span aria-hidden="true">⌁</span>';
 
       const active = document.activeElement;
@@ -1032,7 +1165,7 @@
           : null)
         : null;
 
-      const chipsHtml = isReady && outputChips ? outputChips : `<span class="chip chip-static">${formatLabel}</span>`;
+      const chipsHtml = isReady && outputChips ? outputChips : `<span class="chip chip-static">${summaryIcons}${formatLabel}</span>`;
       element.innerHTML = `<div class="card-thumb">${thumbnail}</div><div class="card-body"><h3 class="card-title">${esc(card.title || 'Untitled')}</h3><div class="card-meta">${esc(card.uploader || '')}${card.uploader && card.duration ? ' · ' : ''}${card.duration ? fmtDur(card.duration) : ''}</div><div class="chips">${chipsHtml}</div>${artifactListHtml}</div><div class="card-actions">${action}</div>`;
       // Stamp the artifact signature so the next poll's fast-path can tell when
       // an artifact changed (status/percent/save state) and fall through to a
@@ -1062,7 +1195,7 @@
         renderCard(index);
       }));
 
-      element.querySelector('[data-download]')?.addEventListener('click', () => dlCard(index));
+      element.querySelector('[data-download]')?.addEventListener('click', () => dlCard(index, 'single-card'));
       element.querySelector('[data-save]')?.addEventListener('click', () => saveCard(index, true));
       element.querySelector('[data-cancel]')?.addEventListener('click', () => cancelCard(index));
 
@@ -1145,10 +1278,10 @@
               cardData[index] = {
                 ...cardData[index],
                 status: 'ready',
-                title: data.title || '',
+                title: normalizeText(data.title || ''),
                 thumbnail: data.thumbnail || '',
                 duration: data.duration,
-                uploader: data.uploader || '',
+                uploader: normalizeText(data.uploader || ''),
                 formats: formats,
                 outputOptions: outputOptions,
                 selectedOutputs: defaultOutputs,
@@ -1182,7 +1315,25 @@
       if (!cardData.some(item => isActiveStatus(item.status))) document.documentElement.dataset.activity = 'idle';
     }
 
-    async function dlCard(index) {
+    // A unique id for one intentional download action. crypto.randomUUID is
+    // used where available; the fallback draws from crypto.getRandomValues and
+    // only falls through to Math.random on a runtime that has neither. The id
+    // is a duplicate-suppression key, not a secret, so a weaker source in that
+    // last case costs collision resistance and nothing else.
+    function newClientRequestId() {
+      const c = typeof crypto !== 'undefined' ? crypto : null;
+      if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+      if (c && typeof c.getRandomValues === 'function') {
+        const bytes = new Uint8Array(16);
+        c.getRandomValues(bytes);
+        return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+      }
+      let out = '';
+      while (out.length < 32) out += Math.random().toString(16).slice(2);
+      return out.slice(0, 32);
+    }
+
+    async function dlCard(index, launchSource) {
       const card = cardData[index];
       if (!card || isActiveStatus(card.status)) return;
 
@@ -1193,6 +1344,11 @@
         return;
       }
 
+      // One id per intentional launch. It travels with this POST (and only
+      // this POST), so if the request is retried at the transport level the
+      // server recognizes the repeat and answers with the job it already
+      // created instead of starting a second download.
+      const clientRequestId = newClientRequestId();
       const launchToken = ++downloadLaunchCounter;
       Object.assign(card, {
         status: 'downloading',
@@ -1225,6 +1381,8 @@
           : outputs.length === 1 && outputs[0].type === 'audio'
           ? { url: card.url, format: 'audio', title: card.title || '' }
           : { url: card.url, outputs: outputs, title: card.title || '' };
+        requestBody.client_request_id = clientRequestId;
+        requestBody.launch_source = launchSource === 'download-all' ? 'download-all' : 'single-card';
 
         const response = await fetch('/api/download', {
           method: 'POST',
@@ -1293,7 +1451,15 @@
             percent: data.percent,
             queuePosition: data.queue_position,
             attempt: data.attempt,
-            maxAttempts: data.max_attempts
+            maxAttempts: data.max_attempts,
+            // Packaging progress. Additive on the wire, so an older server that
+            // omits them leaves these undefined and the row falls back to the
+            // indeterminate packaging state instead of showing stale numbers.
+            processedSeconds: data.processed_seconds,
+            durationSeconds: data.duration_seconds,
+            processingSpeed: data.processing_speed,
+            // Which artifact the parent's packaging label should name.
+            packagingType: currentArtifactType(data)
           });
 
           if (isMulti) {
@@ -1420,13 +1586,67 @@
     // status is the coarse state; phase refines it while the artifact is active
     // (status stays 'downloading' across a retry, only phase moves). Terminal
     // statuses are decided by status alone and ignore any stale phase.
-    // Pure signature of an artifact list: every field the row renders. The
-    // fast path in renderCard compares this against element.dataset.artSig to
-    // decide whether a numeric-only patch is enough or a full rerender is
-    // needed. Extracted as a function so it is unit-testable in Node.
+    // Pure signature of an artifact list: every field that changes the row's
+    // STRUCTURE. The fast path in renderCard compares this against
+    // element.dataset.artSig to decide whether patching the rows in place is
+    // enough or a full rerender is needed. Extracted as a function so it is
+    // unit-testable in Node.
+    //
+    // Live numeric fields (percent, processed_seconds, processing_speed) are
+    // deliberately NOT here: patchArtifactRows writes them straight into the
+    // existing nodes, so forcing a full rebuild for them would drop focus and
+    // rebind every listener several times a second. What must stay is anything
+    // that adds or removes an element: status and phase (they pick the label,
+    // the CSS class and the Save button) and whether a duration is known (an
+    // unknown one draws no bar at all, so its arrival changes the row's shape).
     function artifactSignature(card) {
       if (!card.artifacts || card.artifacts.length <= 1) return '';
-      return card.artifacts.map(a => `${a.id}:${a.status}:${a.phase || ''}:${a.percent | 0}:${a.saved ? 1 : 0}:${a.saving ? 1 : 0}:${a.saveError ? 1 : 0}`).join('|');
+      return card.artifacts.map(a => {
+        const hasDuration = Number.isFinite(a.duration_seconds) && a.duration_seconds > 0 ? 1 : 0;
+        return `${a.id}:${a.status}:${a.phase || ''}:${hasDuration}:${a.saved ? 1 : 0}:${a.saving ? 1 : 0}:${a.saveError ? 1 : 0}`;
+      }).join('|');
+    }
+
+    // Write the live packaging numbers into the artifact rows that are already
+    // on screen. Returns false when the DOM does not line up with the data
+    // (row count, artifact ids, or the presence of a bar), which tells the
+    // caller to fall through to a full render rather than patch blindly.
+    //
+    // ffmpeg reports a new position and a new speed several times a second
+    // while percent may not move a whole point for minutes, so re-rendering
+    // the card for each of those would destroy Cancel's focus, its hover and
+    // focus-visible state, and the artifact objects saveArtifact holds across
+    // an await. Patching in place keeps every node and listener identical.
+    function patchArtifactRows(element, card) {
+      if (!card.artifacts || card.artifacts.length <= 1) return true;
+      const rows = element.querySelectorAll('.artifact-item');
+      if (rows.length !== card.artifacts.length) return false;
+      for (let index = 0; index < card.artifacts.length; index++) {
+        const art = card.artifacts[index];
+        const row = rows[index];
+        if (!row || row.dataset.artifactId !== String(art.id)) return false;
+        const state = artifactDisplayState(art);
+        const statusEl = row.querySelector('.artifact-status');
+        const track = row.querySelector('.artifact-progress');
+        const fill = row.querySelector('.artifact-progress-fill');
+        if (!statusEl) return false;
+        // A bar appearing or disappearing is a structural change, so it is the
+        // full renderer's job, not this one's.
+        if (state.showProgress !== Boolean(track && fill)) return false;
+        const statusClass = `artifact-status ${state.cls}`;
+        if (statusEl.className !== statusClass) statusEl.className = statusClass;
+        const text = `${state.text}${art.saved ? ' · saved' : ''}${art.saveError ? ` · ${art.saveError}` : ''}`;
+        if (statusEl.textContent !== text) statusEl.textContent = text;
+        if (track && fill) {
+          const percent = Number.isFinite(art.percent) ? Math.max(0, Math.min(100, art.percent)) : 0;
+          const width = `${percent}%`;
+          if (fill.style.width !== width) fill.style.width = width;
+          if (track.getAttribute('aria-valuenow') !== String(percent)) {
+            track.setAttribute('aria-valuenow', String(percent));
+          }
+        }
+      }
+      return true;
     }
 
     function artifactDisplayState(art) {
@@ -1447,7 +1667,19 @@
         return { text: 'Retrying…', cls: 'downloading', canSave: false, showProgress: true };
       }
       if (phase === 'processing' || phase === 'postprocessing' || status === 'processing') {
-        return { text: 'Processing…', cls: 'downloading', canSave: false, showProgress: false };
+        // ffmpeg reports real progress now, so the row shows its own bar and
+        // position instead of a bare "Processing…" with no movement. Without a
+        // known input duration there is no honest percentage, so the row stays
+        // textual and the bar is left out rather than faked.
+        const processedText = packagingProcessedText({
+          processedSeconds: art && art.processed_seconds,
+          durationSeconds: art && art.duration_seconds,
+        });
+        const speed = art && Number.isFinite(art.processing_speed) && art.processing_speed > 0
+          ? ` · ${art.processing_speed.toFixed(1)}×` : '';
+        const label = packagingPhaseLabel(art);
+        const text = processedText ? `${label} — ${processedText}${speed}` : `${label}…`;
+        return { text, cls: 'downloading', canSave: false, showProgress: Boolean(processedText) };
       }
       if (phase === 'starting' || status === 'starting') {
         return { text: 'Starting…', cls: 'downloading', canSave: false, showProgress: false };
@@ -1574,7 +1806,7 @@
     document.getElementById('downloadAllBtn').addEventListener('click', async () => {
       const button = document.getElementById('downloadAllBtn');
       button.disabled = true;
-      for (let index = 0; index < cardData.length; index++) if (cardData[index].status === 'ready') await dlCard(index);
+      for (let index = 0; index < cardData.length; index++) if (cardData[index].status === 'ready') await dlCard(index, 'download-all');
       updateManifest();
     });
 

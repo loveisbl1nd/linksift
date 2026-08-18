@@ -5,6 +5,7 @@ The registry is keyed by PARENT job id, never by artifact id, because DELETE
 the real ``app.run_download_command`` with a fake Popen, so they fail if the
 gate is reordered, weakened, or moved outside the jobs_lock critical section.
 """
+import io
 import subprocess
 import threading
 import unittest
@@ -18,7 +19,13 @@ OTHER_PARENT = "9876543210"
 
 
 class FakePopen:
-    """Stands in for subprocess.Popen with the full surface the code touches."""
+    """Stands in for subprocess.Popen with the full surface the code touches.
+
+    ``run_download_command`` merges stderr into stdout and drains that single
+    pipe on a reader thread, so ``stdout`` must be an iterable, closeable
+    stream that reaches EOF. These tests care about the gate and the registry,
+    not about progress, so the transcript is empty.
+    """
 
     instances = []
 
@@ -31,7 +38,7 @@ class FakePopen:
         self.terminated = False
         self.killed = False
         self.waited = False
-        self.stdout = iter(())
+        self.stdout = io.StringIO("")
         FakePopen.instances.append(self)
 
     # --- lifecycle -----------------------------------------------------
@@ -44,10 +51,6 @@ class FakePopen:
         if self.returncode is None:
             self.returncode = 0
         return self.returncode
-
-    def communicate(self, timeout=None):
-        self.wait(timeout=timeout)
-        return "", ""
 
     def terminate(self):
         self.terminated = True

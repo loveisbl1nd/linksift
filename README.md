@@ -74,7 +74,8 @@ LinkSift is a local-first media downloader powered by [yt-dlp](https://github.co
 - **Multi-output downloads** - select multiple output formats for a single URL (e.g., MP4 + MP3). When you choose both video and audio, LinkSift automatically extracts audio from the downloaded video using ffmpeg, saving bandwidth and time. Each completed output gets its own Save button, so you can save one result while the rest are still downloading.
 - **MP4 and MP3 output** - choose a preferred format before inspection.
 - **Quality selection** - choose from the available video heights returned by yt-dlp.
-- **Live progress** - phase, percentage, downloaded bytes, speed, ETA, and final status.
+- **Live progress** - phase, percentage, downloaded bytes, speed, ETA, and final status. Audio packaging reports real ffmpeg progress (media time processed, percent, ETA, and encoding speed) instead of sitting at a fixed percentage, so a multi-output job keeps advancing while ffmpeg extracts the MP3.
+- **Reload-safe queue** - reloading or reopening the tab restores the queue by polling the existing job; it never re-submits a download, and closing the tab does not cancel a running server job. Only the Cancel button asks the server to stop. Each intentional download carries a `client_request_id`, so a retried or duplicated request resolves to the one job it already created.
 - **Browser save controls** - use the default browser download flow or choose a folder in Chromium-based browsers.
 - **Predictable runtime** - Docker includes Python, yt-dlp, ffmpeg, Gunicorn, and a non-root `linksift` user.
 - **Verifiable releases** - version tags publish amd64/arm64 images with OCI metadata, an SBOM, and GitHub build-provenance attestations.
@@ -333,9 +334,11 @@ Multi-output does not add concurrency. The parent still holds one worker slot an
 
 ## YouTube reliability
 
-YouTube periodically rejects freshly extracted media URLs with HTTP 403 and challenges clients with JavaScript puzzles. LinkSift ships three layers of mitigation; none of them guarantees zero 403s, but together they make transient failures recover automatically.
+YouTube periodically rejects freshly extracted media URLs with HTTP 403 and challenges clients with JavaScript puzzles. LinkSift ships four layers of mitigation — a JS runtime, fresh-extraction retries, a conditional embedded-client fallback, and an optional PO token provider. None of them guarantees zero 403s, but together they make transient failures recover automatically.
 
 **Base mode (default image).** The container bundles a pinned [Deno](https://deno.com/) runtime and the [yt-dlp-ejs](https://github.com/yt-dlp/ejs) solver, so yt-dlp can solve YouTube's JS challenges out of the box (`yt-dlp -v` should list `deno` under JS runtimes, not "JS runtimes: none"). On top of that, LinkSift retries failed downloads with a **fresh extraction**: a transient failure (HTTP 403/429/5xx, connection reset, network timeout) re-runs the whole yt-dlp process — obtaining new signed media URLs — up to `LINKSIFT_JOB_RETRIES` extra times with exponential backoff, while keeping `.part` files so the download resumes instead of restarting. The status API reports `attempt`/`max_attempts` and the UI shows "Retrying — attempt N of M".
+
+**Conditional embedded-client fallback.** Some YouTube videos return HTTP 403 on every attempt with yt-dlp's default player client, so re-extracting alone never recovers them. When an attempt fails, LinkSift switches the player client for the *next* retry — but only when both conditions hold: the request URL really is YouTube (the hostname is parsed and matched against `youtube.com`, its subdomains, and `youtu.be`, so a lookalike such as `youtube.com.evil.example` does not qualify) and the yt-dlp stderr genuinely reports `HTTP Error 403: Forbidden`. That retry rebuilds the command from scratch — a fresh extraction — adding `--extractor-args youtube:player_client=web_embedded` while keeping the PO token provider arguments, the selected format, the output path, and the progress contract unchanged. The default client is deliberately kept for the first attempt because some videos disable embedded playback, where forcing `web_embedded` would fail a download that would otherwise succeed. The fallback is applied at most once per download and consumes one of the existing `LINKSIFT_JOB_RETRIES` attempts rather than adding new ones, and cancellation, the shared job deadline, and terminal job status are all re-checked before the retry process is spawned. Non-YouTube URLs and failures that are not 403 never change the client. This is a mitigation, not a cure: it does not fix every YouTube 403, and it adds no cookies or account authentication.
 
 **Robust mode (optional PO token provider).** For setups that still hit 403s, an optional overlay adds a [bgutil PO token provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) sidecar plus the matching yt-dlp plugin (GPL-licensed, so it is not part of the default image):
 
@@ -353,6 +356,7 @@ Cookies remain strictly optional: they are a way to access login-restricted cont
 - Check `GET /api/health`: `capabilities.youtube_js_runtime`/`youtube_ejs` should be `true` in Docker; `po_token_provider` is `true` only in robust mode.
 - In robust mode, `docker logs linksift-bgutil-provider` shows provider activity; LinkSift logs a warning and ignores the provider when `LINKSIFT_PO_TOKEN_PROVIDER_URL` is invalid.
 - If `/api/health` shows `po_token_provider_configured: true` but `po_token_provider: false`, the provider URL is set but the plugin is missing — you are most likely running the default image. Rebuild with the robust overlay (`docker compose -f docker-compose.yml -f docker-compose.youtube-robust.yml up -d --build`); LinkSift logs a warning and simply ignores the provider in the meantime.
+- A YouTube download that hit 403 and was retried with the embedded client logs `Retrying YouTube download with embedded client after HTTP 403` (job and artifact ids only — never the URL or provider token).
 - Persistent, non-transient failures (private/removed videos, "Sign in to confirm…") are not retried by design.
 
 ## Supported sites
