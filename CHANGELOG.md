@@ -4,6 +4,8 @@ All notable changes to LinkSift are documented here.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-19
+
 ### Added
 
 - `POST /api/download` accepts two optional fields, `client_request_id` and `launch_source`. A request id is a 8–128 character `[A-Za-z0-9_-]` string that the UI generates once per intentional download action (`crypto.randomUUID()` where available, with a `getRandomValues` and then a `Math.random` fallback). Reusing an id with the same payload returns the original `job_id` together with `deduplicated: true` instead of creating a second job; reusing it with a different payload is rejected with 409. The duplicate check, the job insert, and the scheduler submit happen in one critical section under the jobs lock, so two concurrent retries of one click can never both reach the scheduler, and the id map is swept by the existing TTL cleanup so it can never outlive the job it points at. Requests that omit both fields behave exactly as before. Job creation and deduplication now emit a structured log line carrying only the job id, the launch source, and whether the job was new — no URL, title, cookie, token, or request body.
@@ -94,7 +96,8 @@ All notable changes to LinkSift are documented here.
 - Playlist truncation is now detected from the raw yt-dlp entry count, so playlists containing unavailable entries still report `truncated` correctly; blank or malformed entries are skipped without failing the request.
 - Container startup now normalizes the entrypoint to LF line endings, including builds made from a Windows working tree.
 
-[Unreleased]: https://github.com/loveisbl1nd/linksift/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/loveisbl1nd/linksift/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/loveisbl1nd/linksift/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/loveisbl1nd/linksift/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/loveisbl1nd/linksift/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/loveisbl1nd/linksift/releases/tag/v0.1.0
