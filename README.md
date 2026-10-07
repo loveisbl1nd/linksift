@@ -101,10 +101,6 @@ docker compose -f compose.ghcr.yml up -d
 
 To build the current source locally instead, run `docker compose up --build -d`.
 
-## Hosted option
-
-Want the same kind of download/info API without running Docker? [Vid Kraken](https://vidkraken.com) is a managed YouTube download API for apps and scripts.
-
 ## Development
 
 The local launcher is for contributors and requires Python 3.12, yt-dlp, and ffmpeg:
